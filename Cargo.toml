@@ -1,0 +1,9 @@
+[package]
+name = "PitchHelper"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cpal = "0.15"
+dark-light = "1.1"
+eframe = "0.31"
