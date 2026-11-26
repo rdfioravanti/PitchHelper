@@ -23,6 +23,7 @@ const VISIBLE_BARS: f32 = 4.0;
 const CENTS_TOLERANCE: f32 = 15.0;
 const LOOP_HANDLE_HIT_RADIUS: f32 = 12.0;
 const ECHO_COUNTDOWN_SECONDS: u64 = 3;
+const COPYRIGHT: &str = "© 2026 Richard Fioravanti";
 const KEY_NAMES: [&str; 12] = [
     "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
 ];
@@ -223,6 +224,7 @@ struct PitchHelperApp {
     last_cycle: u64,
     last_frame: Instant,
     error: Option<String>,
+    about_open: bool,
 }
 
 impl PitchHelperApp {
@@ -308,6 +310,7 @@ impl PitchHelperApp {
             last_cycle: 0,
             last_frame: Instant::now(),
             error: initial_error,
+            about_open: false,
         })
     }
 
@@ -1793,12 +1796,54 @@ impl PitchHelperApp {
                     ui.label(format!("{:.0}%", self.highlight_opacity * 100.0));
                 });
                 ui.menu_button("Help", |ui| {
-                    ui.label(RichText::new("PitchHelper").strong());
-                    ui.label("Sing with a live pitch display and backing track.");
+                    if ui.button("About PitchHelper…").clicked() {
+                        self.about_open = true;
+                    }
                 });
             });
         });
         open_audio
+    }
+
+    fn draw_about(&mut self, ctx: &egui::Context) {
+        egui::Window::new("About PitchHelper")
+            .resizable(false)
+            .open(&mut self.about_open)
+            .default_width(380.0)
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new("PitchHelper").size(22.0).strong());
+                    ui.label(
+                        RichText::new(format!("version {}", env!("CARGO_PKG_VERSION")))
+                            .size(11.0)
+                            .color(Color32::from_rgb(125, 145, 161)),
+                    );
+                });
+                ui.add_space(10.0);
+                ui.label("A live pitch coach for singers.");
+                ui.add_space(8.0);
+
+                ui.strong("What it does");
+                ui.label("•  Tracks your live pitch — closest note and cents of tuning.");
+                ui.label("•  Plots your pitch over a moving four-bar 4/4 timeline.");
+                ui.label("•  Plays a backing track (WAV/MP3/FLAC/OGG) with an auto-detected tempo, a metronome, and a seekable waveform.");
+                ui.label("•  Practice tools: key/scale highlighting, a reference tone, warm-ups, and a pitch-echo game.");
+                ui.label("•  Tracks your vocal range and tessitura over time.");
+                ui.add_space(8.0);
+
+                ui.strong("Reading the display");
+                ui.label("•  Green = in tune (within 15 cents)   ·   Red = flat   ·   Blue = sharp");
+                ui.add_space(8.0);
+
+                ui.strong("Tips");
+                ui.label("•  Use the Pitch Sensitivity slider if the app can't hear quieter singing.");
+                ui.label("•  Choose a Key and Scale to highlight in-scale notes; chord tones are emphasized.");
+                ui.label("•  Use Zoom, LOW and HIGH to shape the graph.");
+                ui.label("•  Right-click the waveform to reset the A/B loop handles.");
+                ui.add_space(10.0);
+
+                ui.weak(COPYRIGHT);
+            });
     }
 
     fn draw_pitch_readout(&self, ui: &mut egui::Ui) {
@@ -2255,6 +2300,10 @@ impl eframe::App for PitchHelperApp {
                             .size(10.0)
                             .color(footer_text),
                     );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.add_space(12.0);
+                        ui.label(RichText::new(COPYRIGHT).size(10.0).color(footer_text));
+                    });
                 });
             });
 
@@ -2277,6 +2326,8 @@ impl eframe::App for PitchHelperApp {
             self.draw_track_waveform(ui, self.applied_dark);
             self.draw_graph(ui, self.applied_dark);
         });
+
+        self.draw_about(ctx);
         ctx.request_repaint_after(Duration::from_millis(33));
     }
 }
