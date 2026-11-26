@@ -1,6 +1,6 @@
 # PitchHelper
 
-PitchHelper is a native Rust desktop app for singers. It listens to the default
+PitchHelper is a native Rust desktop app for singers. It listens to a selected
 microphone, shows the closest note and tuning deviation, and plots pitch across
 a moving four-bar 4/4 timeline.
 
@@ -12,13 +12,17 @@ Install the Rust toolchain, then run:
 cargo run
 ```
 
-Allow microphone access when prompted. Use **Start listening** to begin pitch
-tracking and adjust the tempo slider to set the timeline speed. Notes within
-15 cents of pitch are green, flat notes are red, and sharp notes are blue.
-Enharmonic spellings are shown for sharp notes.
+Use **Start listening** to begin pitch tracking and select an input device from
+the adjacent menu. Notes within 15 cents of pitch are green, flat notes are
+red, and sharp notes are blue. Enharmonic spellings are shown for sharp notes.
 
-The appearance menu follows the operating-system theme by default and can be
-overridden with Light or Dark.
+Use **File > Open audio** to load WAV, MP3, FLAC, or OGG backing tracks. PitchHelper
+attempts to detect a steady tempo and applies it to the timeline; use the tempo
+slider to override the detected BPM. Play, pause, or stop the track from the
+playback controls. Enable the metronome and adjust its volume under **Settings**.
+
+The appearance setting follows the operating-system theme by default and can
+be overridden with Light or Dark under **Settings > Appearance**.
 
 ## Build
 

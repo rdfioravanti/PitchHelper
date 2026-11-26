@@ -1,12 +1,16 @@
 mod audio;
+mod music;
 mod pitch;
+mod playback;
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use audio::Microphone;
+use audio::{InputDevice, Metronome, Microphone};
 use eframe::egui::{self, Align, Color32, FontId, Layout, RichText, Stroke, Vec2};
 use pitch::{PitchReading, midi_to_note};
+use playback::SongPlayer;
 
 const BAR_BEATS: f32 = 4.0;
 const VISIBLE_BARS: f32 = 4.0;
@@ -37,6 +41,16 @@ enum ThemeChoice {
 
 struct PitchHelperApp {
     microphone: Microphone,
+    input_devices: Vec<InputDevice>,
+    selected_input: usize,
+    metronome: Metronome,
+    metronome_enabled: bool,
+    metronome_volume: f32,
+    player: SongPlayer,
+    audio_file: Option<PathBuf>,
+    track_name: Option<String>,
+    detected_bpm: Option<f32>,
+    bpm_overridden: bool,
     bpm: f32,
     last_bpm: f32,
     theme: ThemeChoice,
@@ -57,8 +71,26 @@ impl PitchHelperApp {
         let theme = ThemeChoice::System;
         let applied_dark = theme_is_dark(theme);
         set_theme(&cc.egui_ctx, applied_dark);
+        let (input_devices, initial_error) = match Microphone::available_devices() {
+            Ok(devices) => (devices, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
+        let selected_input = input_devices
+            .iter()
+            .position(|device| device.is_default)
+            .unwrap_or(0);
         Self {
             microphone: Microphone::new(),
+            input_devices,
+            selected_input,
+            metronome: Metronome::new(100.0, 0.35),
+            metronome_enabled: false,
+            metronome_volume: 0.35,
+            player: SongPlayer::new(),
+            audio_file: None,
+            track_name: None,
+            detected_bpm: None,
+            bpm_overridden: false,
             bpm: 100.0,
             last_bpm: 100.0,
             theme,
@@ -71,7 +103,7 @@ impl PitchHelperApp {
             last_cycle: 0,
             last_frame: Instant::now(),
             last_analysis: Instant::now(),
-            error: None,
+            error: initial_error,
         }
     }
 
@@ -120,19 +152,8 @@ impl PitchHelperApp {
             ui.add_space(4.0);
             ui.label(RichText::new("helper").size(17.0).strong());
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                egui::ComboBox::from_id_salt("theme_choice")
-                    .selected_text(match self.theme {
-                        ThemeChoice::System => "System",
-                        ThemeChoice::Light => "Light",
-                        ThemeChoice::Dark => "Dark",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.theme, ThemeChoice::System, "System");
-                        ui.selectable_value(&mut self.theme, ThemeChoice::Light, "Light");
-                        ui.selectable_value(&mut self.theme, ThemeChoice::Dark, "Dark");
-                    });
                 ui.label(
-                    RichText::new("APPEARANCE")
+                    RichText::new("LIVE PITCH COACH")
                         .size(10.0)
                         .strong()
                         .color(Color32::from_rgb(125, 145, 161)),
@@ -150,30 +171,84 @@ impl PitchHelperApp {
                     .color(Color32::from_rgb(125, 145, 161)),
             );
             ui.add_space(6.0);
-            ui.add(
+            let response = ui.add(
                 egui::Slider::new(&mut self.bpm, 40.0..=240.0)
                     .suffix(" BPM")
                     .show_value(false),
             );
+            if response.changed() && self.detected_bpm.is_some() {
+                self.bpm_overridden = true;
+            }
             ui.label(
                 RichText::new(format!("{:.0}", self.bpm))
                     .monospace()
                     .strong(),
             );
-            ui.add_space(18.0);
+            if let Some(detected_bpm) = self.detected_bpm {
+                ui.label(
+                    RichText::new(if self.bpm_overridden {
+                        format!("file: {detected_bpm:.0} BPM · adjusted")
+                    } else {
+                        format!("file: {detected_bpm:.0} BPM")
+                    })
+                    .size(10.0)
+                    .color(Color32::from_rgb(125, 145, 161)),
+                );
+            }
+        });
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            let selected_name = self
+                .input_devices
+                .get(self.selected_input)
+                .map(|device| {
+                    if device.is_default {
+                        format!("{} (default)", device.name)
+                    } else {
+                        device.name.clone()
+                    }
+                })
+                .unwrap_or_else(|| "No microphones found".to_owned());
+            let mut selected = self.selected_input;
+            egui::ComboBox::from_id_salt("microphone_input")
+                .selected_text(selected_name)
+                .width(220.0)
+                .show_ui(ui, |ui| {
+                    for (index, device) in self.input_devices.iter().enumerate() {
+                        let label = if device.is_default {
+                            format!("{} (default)", device.name)
+                        } else {
+                            device.name.clone()
+                        };
+                        ui.selectable_value(&mut selected, index, label);
+                    }
+                });
+            if selected != self.selected_input {
+                self.selected_input = selected;
+                if self.microphone.is_running() {
+                    self.microphone.stop();
+                    self.start_listening();
+                }
+            }
             let button_text = if self.microphone.is_running() {
                 "Stop listening"
             } else {
                 "Start listening"
             };
-            if ui.button(button_text).clicked() {
+            if ui
+                .add_enabled(
+                    self.microphone.is_running() || !self.input_devices.is_empty(),
+                    egui::Button::new(button_text),
+                )
+                .clicked()
+            {
                 self.error = None;
                 if self.microphone.is_running() {
                     self.microphone.stop();
                     self.reading = None;
                     self.history.clear();
-                } else if let Err(message) = self.microphone.start() {
-                    self.error = Some(message);
+                } else {
+                    self.start_listening();
                 }
             }
             if self.microphone.is_running() {
@@ -191,6 +266,184 @@ impl PitchHelperApp {
                 );
             }
         });
+    }
+
+    fn draw_track_controls(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            if let Some(path) = self.audio_file.clone() {
+                ui.label(
+                    RichText::new(self.track_name.as_deref().unwrap_or("Audio track"))
+                        .strong()
+                        .size(13.0),
+                );
+                let play_label = if self.player.is_playing() {
+                    "Pause"
+                } else if self.player.is_paused() {
+                    "Resume"
+                } else {
+                    "Play"
+                };
+                if ui.button(play_label).clicked() {
+                    self.error = None;
+                    if let Err(message) = self.player.toggle(&path) {
+                        self.error = Some(message);
+                    }
+                }
+                if ui.button("Stop").clicked() {
+                    self.player.stop();
+                }
+                if let Some(detected_bpm) = self.detected_bpm {
+                    ui.label(
+                        RichText::new(format!("Auto-detected {detected_bpm:.0} BPM"))
+                            .size(11.0)
+                            .color(Color32::from_rgb(125, 145, 161)),
+                    );
+                } else {
+                    ui.label(
+                        RichText::new("No steady BPM detected · Set tempo above")
+                            .size(11.0)
+                            .color(Color32::from_rgb(125, 145, 161)),
+                    );
+                }
+            } else {
+                ui.label(
+                    RichText::new("No backing track loaded · Open audio from File")
+                        .size(11.0)
+                        .color(Color32::from_rgb(125, 145, 161)),
+                );
+            }
+        });
+    }
+
+    fn start_listening(&mut self) {
+        self.error = None;
+        let Some(device) = self.input_devices.get(self.selected_input) else {
+            self.error = Some(
+                "No microphone is available. Connect an input device and refresh the list."
+                    .to_owned(),
+            );
+            return;
+        };
+        if let Err(message) = self.microphone.start(device) {
+            self.error = Some(message);
+        }
+    }
+
+    fn refresh_input_devices(&mut self) {
+        let selected_name = self
+            .input_devices
+            .get(self.selected_input)
+            .map(|device| device.name.clone());
+        match Microphone::available_devices() {
+            Ok(devices) => {
+                self.input_devices = devices;
+                self.selected_input = selected_name
+                    .and_then(|name| {
+                        self.input_devices
+                            .iter()
+                            .position(|device| device.name == name)
+                    })
+                    .or_else(|| {
+                        self.input_devices
+                            .iter()
+                            .position(|device| device.is_default)
+                    })
+                    .unwrap_or(0);
+                if self.microphone.is_running() {
+                    self.microphone.stop();
+                    self.start_listening();
+                }
+            }
+            Err(message) => self.error = Some(message),
+        }
+    }
+
+    fn choose_audio_file(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Audio files", &["wav", "mp3", "flac", "ogg"])
+            .pick_file()
+        else {
+            return;
+        };
+
+        self.error = None;
+        match music::analyze_bpm(&path) {
+            Ok(detected_bpm) => {
+                self.player.stop();
+                self.track_name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned());
+                self.audio_file = Some(path);
+                self.detected_bpm = detected_bpm;
+                self.bpm_overridden = false;
+                if let Some(detected_bpm) = detected_bpm {
+                    self.bpm = detected_bpm;
+                } else {
+                    self.error = Some(
+                        "Track loaded, but no steady BPM was detected. Set the tempo manually."
+                            .to_owned(),
+                    );
+                }
+                self.history.clear();
+            }
+            Err(message) => self.error = Some(message),
+        }
+    }
+
+    fn draw_menu_bar(&mut self, ctx: &egui::Context) -> (bool, bool, bool) {
+        let mut open_audio = false;
+        let mut refresh_inputs = false;
+        let mut metronome_changed = false;
+        egui::TopBottomPanel::top("application_menu").show(ctx, |ui| {
+            egui::menu::bar(ui, |ui| {
+                ui.menu_button("File", |ui| {
+                    if ui.button("Open audio…").clicked() {
+                        open_audio = true;
+                    }
+                    if ui
+                        .add_enabled(
+                            self.audio_file.is_some(),
+                            egui::Button::new("Stop playback"),
+                        )
+                        .clicked()
+                    {
+                        self.player.stop();
+                    }
+                    ui.separator();
+                    if ui.button("Quit").clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+                ui.menu_button("Settings", |ui| {
+                    ui.menu_button("Appearance", |ui| {
+                        ui.selectable_value(&mut self.theme, ThemeChoice::System, "System");
+                        ui.selectable_value(&mut self.theme, ThemeChoice::Light, "Light");
+                        ui.selectable_value(&mut self.theme, ThemeChoice::Dark, "Dark");
+                    });
+                    ui.separator();
+                    if ui
+                        .checkbox(&mut self.metronome_enabled, "Enable metronome")
+                        .changed()
+                    {
+                        metronome_changed = true;
+                    }
+                    ui.add_enabled(
+                        self.metronome_enabled,
+                        egui::Slider::new(&mut self.metronome_volume, 0.0..=1.0).text("Volume"),
+                    );
+                    ui.separator();
+                    if ui.button("Refresh microphones").clicked() {
+                        refresh_inputs = true;
+                    }
+                });
+                ui.menu_button("Help", |ui| {
+                    ui.label(RichText::new("PitchHelper").strong());
+                    ui.label("Sing with a live pitch display and backing track.");
+                });
+            });
+        });
+        (open_audio, refresh_inputs, metronome_changed)
     }
 
     fn draw_pitch_readout(&self, ui: &mut egui::Ui) {
@@ -372,6 +625,8 @@ impl eframe::App for PitchHelperApp {
         self.elapsed += now.duration_since(self.last_frame).as_secs_f32();
         self.last_frame = now;
         self.update_audio();
+        self.metronome.set_bpm(self.bpm);
+        self.metronome.set_volume(self.metronome_volume);
 
         if self.theme != self.applied_theme
             || self.last_theme_check.elapsed() >= Duration::from_secs(1)
@@ -385,11 +640,26 @@ impl eframe::App for PitchHelperApp {
             self.last_theme_check = now;
         }
 
+        let (open_audio, refresh_inputs, metronome_changed) = self.draw_menu_bar(ctx);
+        if open_audio {
+            self.choose_audio_file();
+        }
+        if refresh_inputs {
+            self.refresh_input_devices();
+        }
+        if metronome_changed
+            && let Err(message) = self.metronome.set_enabled(self.metronome_enabled)
+        {
+            self.metronome_enabled = false;
+            self.error = Some(message);
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(8.0);
             self.draw_header(ui);
             ui.add_space(22.0);
             self.draw_controls(ui);
+            self.draw_track_controls(ui);
             if let Some(error) = &self.error {
                 ui.add_space(8.0);
                 ui.colored_label(Color32::from_rgb(220, 75, 75), error);
