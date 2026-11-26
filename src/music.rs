@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::ErrorKind;
 use std::path::Path;
+use std::time::Duration;
 
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
@@ -10,7 +11,15 @@ use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
-pub fn analyze_bpm(path: &Path) -> Result<Option<f32>, String> {
+const WAVEFORM_BINS: usize = 1600;
+
+pub struct TrackAnalysis {
+    pub bpm: Option<f32>,
+    pub duration: Duration,
+    pub waveform: Vec<f32>,
+}
+
+pub fn analyze_track(path: &Path) -> Result<TrackAnalysis, String> {
     let file = File::open(path).map_err(|error| format!("Could not open audio file: {error}"))?;
     let source = MediaSourceStream::new(Box::new(file), MediaSourceStreamOptions::default());
     let probed = symphonia::default::get_probe()
@@ -66,7 +75,39 @@ pub fn analyze_bpm(path: &Path) -> Result<Option<f32>, String> {
 
     let sample_rate = sample_rate
         .ok_or_else(|| "The audio file did not contain decodable samples.".to_owned())?;
-    Ok(detect_bpm(&mono, sample_rate))
+    let duration = Duration::from_secs_f64(mono.len() as f64 / sample_rate as f64);
+    Ok(TrackAnalysis {
+        bpm: detect_bpm(&mono, sample_rate),
+        duration,
+        waveform: waveform_envelope(&mono, WAVEFORM_BINS),
+    })
+}
+
+fn waveform_envelope(samples: &[f32], bin_limit: usize) -> Vec<f32> {
+    if samples.is_empty() || bin_limit == 0 {
+        return Vec::new();
+    }
+
+    let bin_count = bin_limit.min(samples.len());
+    let mut envelope = Vec::with_capacity(bin_count);
+    for bin in 0..bin_count {
+        let start = bin * samples.len() / bin_count;
+        let end = (bin + 1) * samples.len() / bin_count;
+        let rms = (samples[start..end]
+            .iter()
+            .map(|sample| sample * sample)
+            .sum::<f32>()
+            / (end - start) as f32)
+            .sqrt();
+        envelope.push(rms);
+    }
+    let peak = envelope.iter().copied().fold(0.0_f32, f32::max);
+    if peak > 0.0 {
+        for value in &mut envelope {
+            *value /= peak;
+        }
+    }
+    envelope
 }
 
 fn detect_bpm(samples: &[f32], sample_rate: u32) -> Option<f32> {
@@ -149,7 +190,7 @@ fn detect_bpm(samples: &[f32], sample_rate: u32) -> Option<f32> {
 
 #[cfg(test)]
 mod tests {
-    use super::detect_bpm;
+    use super::{detect_bpm, waveform_envelope};
 
     #[test]
     fn estimates_tempo_from_regular_transients() {
@@ -166,5 +207,16 @@ mod tests {
 
         let bpm = detect_bpm(&samples, sample_rate).expect("regular beat should be detected");
         assert!((bpm - 120.0).abs() < 3.0, "expected 120 BPM, got {bpm}");
+    }
+
+    #[test]
+    fn waveform_envelope_is_normalized_and_limited_to_requested_bins() {
+        let envelope = waveform_envelope(&[1.0, 1.0, 0.0, 0.0, -0.5, -0.5, 0.0, 0.0], 4);
+        assert_eq!(envelope, vec![1.0, 0.0, 0.5, 0.0]);
+        assert!(
+            waveform_envelope(&[0.0; 20], 8)
+                .iter()
+                .all(|value| *value == 0.0)
+        );
     }
 }
