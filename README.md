@@ -155,16 +155,15 @@ both. Seeking outside the visible four-measure cycle clears the pitch trace.
 
 Use **Zoom**, **LOW**, and **HIGH** beside the tempo control to shape the graph.
 
-- **LOW / HIGH** set the graph's boundaries without changing its zoom level. Zoom uses
-  a fixed semitone span: **1×** shows 36 semitones, **0.5×** shows up to 72, and **2×**
-  shows 18. Narrow bounds can restrict the visible span.
+- **LOW / HIGH** set the graph's boundaries. Zoom scales relative to the selected
+  range: **0.5×** shows the full range, **1×** shows half, and **2×** shows a quarter.
 - In free singing, the graph follows your live pitch smoothly as it nears the edge,
   without moving beyond LOW/HIGH.
 - During warm-ups and pitch echo it centers on the exercise's target notes; the
   exercise playhead follows the phrase and response rather than the full four-bar
   cycle.
 
-The default graph bounds are **C1–C7**. The LOW and HIGH menus can be adjusted
+The default graph bounds are **C2–C6**. The LOW and HIGH menus can be adjusted
 between **C0 and C9**. Note names use ASCII accidentals (e.g. `C#`, `Db`).
 
 ### Practice tools
@@ -181,7 +180,8 @@ warm-ups, and pitch echo.
 
 - **Warm-Up** plays five-tone **scales, octaves, arpeggios, or sirens** from the
   shared root at one note per beat using the selected tempo, moving by a semitone
-  between passes across an octave. Changing the root, scale, or pattern stops the
+  between passes across an octave. A **3–2–1 countdown** starts the first phrase;
+  later passes begin immediately. Changing the root, scale, or pattern stops the
   current warm-up.
 - **Pitch Echo** lets you select a Warm-Up pattern. Every sequence begins with a
   **3–2–1 countdown**, plays at the selected tempo, then shows another **3–2–1 pause**
@@ -232,8 +232,8 @@ separate submenu for adjusting the key/scale highlight strength.
 | Scale-row highlight opacity    | 4%                          | In-scale tint; chord tones are stronger.                 |
 | Reference tone                 | Root or fifth               | Shown as a yellow target line.                           |
 | Pitch detection range          | 25 – 2,500 Hz               | Autocorrelation over the mic buffer.                     |
-| Graph bounds                   | C1–C7                       | Adjustable from C0 to C9.                                |
-| Graph zoom                     | 1× (36 semitones)           | LOW/HIGH constrain bounds, not zoom.                     |
+| Graph bounds                   | C2–C6                       | Adjustable from C0 to C9.                                |
+| Graph zoom                     | 1× (half the range)         | 0.5× shows all LOW/HIGH notes.                            |
 | Metronome                      | Off                         | Enable with the Metronome controls.                      |
 | Metronome volume               | 35%                         | Adjustable independently of track volume.               |
 | Pitch Echo sequence            | Warm-Up pattern             | Score is shown until you advance to the next sequence.   |

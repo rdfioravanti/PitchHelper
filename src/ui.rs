@@ -1,12 +1,11 @@
 use super::{
-    AudioLoadStatus, BAR_BEATS, BASE_GRAPH_VIEW_SPAN, CENTS_TOLERANCE, COPYRIGHT, EchoPhase,
-    LOOP_HANDLE_HIT_RADIUS, LoopHandle, PitchHelperApp, ReferenceKind, Scale, ThemeChoice,
-    VISIBLE_BARS, WarmupPattern, advance_beat_position, advance_song_beat_position,
-    beats_per_cycle, close_menu_if_pointer_left, draw_practice_target_notes, draw_target_notes,
-    echo_countdown_value, echo_sequence_phase, format_track_time, graph_high_note_choices,
-    graph_low_note_choices, measure_phase, midi_to_note, move_loop_handle, pitch, pitch_color,
-    pitch_metrics, practice_phase, root_note_choices, set_theme, should_show_scrub_preview,
-    theme_is_dark, zoom_label,
+    AudioLoadStatus, BAR_BEATS, CENTS_TOLERANCE, COPYRIGHT, EchoPhase, LOOP_HANDLE_HIT_RADIUS,
+    LoopHandle, PitchHelperApp, ReferenceKind, Scale, ThemeChoice, VISIBLE_BARS, WarmupPattern,
+    advance_beat_position, advance_song_beat_position, beats_per_cycle, close_menu_if_pointer_left,
+    countdown_value, draw_practice_target_notes, draw_target_notes,
+    format_track_time, graph_high_note_choices, graph_low_note_choices, measure_phase,
+    midi_to_note, move_loop_handle, pitch, pitch_color, pitch_metrics, practice_phase,
+    root_note_choices, set_theme, should_show_scrub_preview, theme_is_dark, zoom_label,
 };
 use std::time::{Duration, Instant};
 
@@ -80,11 +79,7 @@ impl PitchHelperApp {
                     .show_value(false),
             )
             .on_hover_text(
-                format!(
-                    "Zoom is independent of LOW/HIGH. 0.5x shows up to {:.0} semitones; 1x shows {:.0}. The selected bounds can restrict the view.",
-                    BASE_GRAPH_VIEW_SPAN,
-                    BASE_GRAPH_VIEW_SPAN / 2.0
-                ),
+                "Zoom is relative to the selected LOW/HIGH range. 0.5x shows all notes; 1x shows half the range; 2x shows a quarter.",
             );
             ui.label(zoom_label(self.zoom_scale));
 
@@ -1194,7 +1189,7 @@ impl PitchHelperApp {
                         .size(DIALOG_BODY_SIZE),
                 );
                 ui.label(
-                    RichText::new("Key / Scale highlights notes. The shared root sets the reference tone and exercises; Warm-Up and Pitch Echo share a pattern.")
+                    RichText::new("Key / Scale highlights notes. The shared root sets the reference tone and exercises; Warm-Up counts down once, and Warm-Up and Pitch Echo share a pattern.")
                         .size(DIALOG_BODY_SIZE),
                 );
                 ui.label(
@@ -1413,9 +1408,9 @@ impl PitchHelperApp {
             Color32::from_rgb(247, 249, 251)
         };
         let grid = if dark {
-            Color32::from_rgb(41, 52, 64)
+            Color32::from_rgb(62, 75, 90)
         } else {
-            Color32::from_rgb(222, 229, 235)
+            Color32::from_rgb(205, 216, 226)
         };
         let muted = if dark {
             Color32::from_rgb(130, 147, 162)
@@ -1490,35 +1485,46 @@ impl PitchHelperApp {
                 );
             }
         }
+
+        let label_start = low_midi.ceil() as i32;
+        let label_end = high_midi.floor() as i32;
+        let label_stride = (13.0 / row_height).ceil().max(1.0) as i32;
+        for midi in label_start..=label_end {
+            let y =
+                plot.bottom() - (midi as f32 - low_midi) / (high_midi - low_midi) * plot.height();
+            painter.line_segment(
+                [egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)],
+                Stroke::new(
+                    if midi.rem_euclid(12) == 0 {
+                        1.6_f32
+                    } else {
+                        1.0_f32
+                    },
+                    grid,
+                ),
+            );
+            if (midi - label_start) % label_stride == 0 {
+                let (_, name, _) = midi_to_note(midi as f32);
+                painter.text(
+                    egui::pos2(rect.left() + 10.0, y),
+                    egui::Align2::LEFT_CENTER,
+                    name,
+                    FontId::monospace(10.0),
+                    muted,
+                );
+            }
+        }
         painter.text(
             egui::pos2(plot.right(), rect.top() + 7.0),
             egui::Align2::RIGHT_CENTER,
             format!(
-                "{} {} · brighter rows are chord tones",
+                "{} {} · tinted rows: scale · brighter: chord tones",
                 midi_to_note(self.root_note as f32).1,
                 self.scale.label()
             ),
             FontId::proportional(9.0),
             muted,
         );
-        let label_start = low_midi.ceil() as i32;
-        let label_end = high_midi.floor() as i32;
-        for midi in (label_start..=label_end).step_by(3) {
-            let y =
-                plot.bottom() - (midi as f32 - low_midi) / (high_midi - low_midi) * plot.height();
-            painter.line_segment(
-                [egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)],
-                Stroke::new(if midi % 12 == 0 { 1.2_f32 } else { 0.7_f32 }, grid),
-            );
-            let (_, name, _) = midi_to_note(midi as f32);
-            painter.text(
-                egui::pos2(rect.left() + 10.0, y),
-                egui::Align2::LEFT_CENTER,
-                name,
-                FontId::monospace(10.0),
-                muted,
-            );
-        }
 
         for bar in 0..=VISIBLE_BARS as usize {
             let x = plot.left() + bar as f32 / VISIBLE_BARS * plot.width();
@@ -1582,12 +1588,13 @@ impl PitchHelperApp {
                 Color32::from_rgb(248, 191, 76),
             );
         } else if let Some(session) = &self.echo {
-            draw_target_notes(
+            draw_practice_target_notes(
                 &painter,
                 plot,
                 low_midi,
                 high_midi,
                 &session.notes,
+                session.note_duration,
                 Color32::from_rgb(105, 208, 190),
             );
         } else if self.reference_enabled {
@@ -1602,10 +1609,18 @@ impl PitchHelperApp {
             );
         }
 
-        if let Some(session) = &self.echo
-            && matches!(session.phase, EchoPhase::Countdown | EchoPhase::Pause)
-            && let Some(number) = echo_countdown_value(now.duration_since(session.started_at))
-        {
+        let countdown = self
+            .echo
+            .as_ref()
+            .filter(|session| matches!(session.phase, EchoPhase::Countdown | EchoPhase::Pause))
+            .map(|session| now.duration_since(session.started_at))
+            .or_else(|| {
+                self.warmup
+                    .as_ref()
+                    .and_then(|session| session.countdown_started_at)
+                    .map(|started_at| now.duration_since(started_at))
+            });
+        if let Some(number) = countdown.and_then(countdown_value) {
             painter.circle_filled(
                 plot.center(),
                 48.0,
@@ -1624,16 +1639,15 @@ impl PitchHelperApp {
             match session.phase {
                 EchoPhase::Countdown | EchoPhase::Pause => 0.0,
                 EchoPhase::Prompting | EchoPhase::Responding | EchoPhase::Score => {
-                    echo_sequence_phase(
-                        now,
-                        session.started_at,
-                        session.note_duration,
-                        session.notes.len(),
-                    )
+                    practice_phase(now, session.started_at, session.note_duration)
                 }
             }
         } else if let Some(session) = &self.warmup {
-            practice_phase(now, session.started_at, session.note_duration)
+            if session.countdown_started_at.is_some() {
+                0.0
+            } else {
+                practice_phase(now, session.started_at, session.note_duration)
+            }
         } else {
             self.measure_phase
         };

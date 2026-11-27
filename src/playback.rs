@@ -301,9 +301,11 @@ fn practice_samples(notes: &[i32], note_duration: Duration, sample_rate: u32) ->
     let fade_frames = ((NOTE_EDGE_FADE.as_secs_f64() * sample_rate as f64).round() as usize)
         .min(frames_per_note / 2);
     let mut samples = Vec::with_capacity(frames_per_note.saturating_mul(notes.len()));
+    let mut phase = 0.0_f64;
+    let tau = std::f64::consts::TAU;
 
     for note in notes {
-        let frequency = midi_frequency(*note);
+        let phase_step = tau * midi_frequency(*note) as f64 / sample_rate as f64;
         for frame in 0..frames_per_note {
             let attack = if frame < fade_frames {
                 0.5 - 0.5 * (std::f32::consts::PI * frame as f32 / fade_frames as f32).cos()
@@ -316,8 +318,8 @@ fn practice_samples(notes: &[i32], note_duration: Duration, sample_rate: u32) ->
             } else {
                 1.0
             };
-            let phase = std::f32::consts::TAU * frequency * frame as f32 / sample_rate as f32;
-            samples.push(phase.sin() * attack.min(release));
+            samples.push(phase.sin() as f32 * attack.min(release));
+            phase = (phase + phase_step).rem_euclid(tau);
         }
     }
 
@@ -326,7 +328,7 @@ fn practice_samples(notes: &[i32], note_duration: Duration, sample_rate: u32) ->
 
 #[cfg(test)]
 mod tests {
-    use super::{FadeOut, PRACTICE_SAMPLE_RATE, practice_samples};
+    use super::{FadeOut, NOTE_EDGE_FADE, PRACTICE_SAMPLE_RATE, practice_samples};
     use rodio::buffer::SamplesBuffer;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
@@ -346,6 +348,22 @@ mod tests {
         assert!(samples[frames_per_note - 2].abs() < 0.01);
         assert!(samples[frames_per_note + 1].abs() < 0.01);
         assert!(samples.iter().any(|sample| sample.abs() > 0.5));
+    }
+
+    #[test]
+    fn practice_tone_waveform_stays_smooth_throughout_long_notes() {
+        let note_duration = Duration::from_secs(2);
+        let frames_per_note =
+            (note_duration.as_secs_f64() * PRACTICE_SAMPLE_RATE as f64).round() as usize;
+        let samples = practice_samples(&[69], note_duration, PRACTICE_SAMPLE_RATE);
+        let fade_frames =
+            (NOTE_EDGE_FADE.as_secs_f64() * PRACTICE_SAMPLE_RATE as f64).round() as usize;
+        let largest_step = samples[fade_frames..frames_per_note - fade_frames]
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]).abs())
+            .fold(0.0_f32, f32::max);
+
+        assert!(largest_step < 0.1, "largest sample step was {largest_step}");
     }
 
     #[test]

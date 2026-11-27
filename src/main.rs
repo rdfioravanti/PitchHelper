@@ -22,8 +22,7 @@ const BAR_BEATS: f32 = 4.0;
 const VISIBLE_BARS: f32 = 4.0;
 const CENTS_TOLERANCE: f32 = 15.0;
 const LOOP_HANDLE_HIT_RADIUS: f32 = 12.0;
-const ECHO_COUNTDOWN_SECONDS: u64 = 3;
-const BASE_GRAPH_VIEW_SPAN: f32 = 72.0;
+const COUNTDOWN_SECONDS: u64 = 3;
 const DEFAULT_RANGE_SENSITIVITY: f32 = 35.0;
 const RANGE_TRACKING_MIN_RMS: f32 = 0.002;
 const RANGE_TRACKING_MAX_RMS: f32 = 0.04;
@@ -61,6 +60,7 @@ struct WarmupSession {
     direction: i32,
     note_duration: Duration,
     started_at: Instant,
+    countdown_started_at: Option<Instant>,
     notes: Vec<i32>,
 }
 
@@ -94,7 +94,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("PitchHelper")
             .with_icon(Arc::new(app_icon))
-            .with_inner_size([1120.0, 760.0])
+            .with_inner_size([1120.0, 800.0])
             .with_min_inner_size([900.0, 600.0]),
         ..Default::default()
     };
@@ -242,8 +242,8 @@ impl PitchHelperApp {
             session_range_tracker: RangeTracker::default(),
             range_dirty: false,
             last_range_save: Instant::now(),
-            graph_min_limit: 24.0,
-            graph_max_limit: 96.0,
+            graph_min_limit: 36.0,
+            graph_max_limit: 84.0,
             zoom_scale: 1.0,
             graph_center: 60.0,
             center_on_root: true,
@@ -293,11 +293,10 @@ impl PitchHelperApp {
                 | EchoPhase::Prompting
                 | EchoPhase::Pause
                 | EchoPhase::Score => None,
-                EchoPhase::Responding => Some(echo_sequence_phase(
+                EchoPhase::Responding => Some(practice_phase(
                     now,
                     session.started_at,
                     session.note_duration,
-                    session.notes.len(),
                 )),
             }
         } else if let Some(session) = &self.warmup {
@@ -356,11 +355,7 @@ impl PitchHelperApp {
         let tonic = self.root_note;
         let notes = warmup_notes(self.exercise_pattern, tonic);
         let note_duration = exercise_note_duration(self.bpm);
-        if let Err(message) = self.tone_player.play_notes(&notes, note_duration, 0.25) {
-            self.warmup = None;
-            self.error = Some(message);
-            return;
-        }
+        let now = Instant::now();
         self.warmup = Some(WarmupSession {
             pattern: self.exercise_pattern,
             tonic,
@@ -368,7 +363,8 @@ impl PitchHelperApp {
             high_tonic: tonic + 12,
             direction: 1,
             note_duration,
-            started_at: Instant::now(),
+            started_at: now,
+            countdown_started_at: Some(now),
             notes,
         });
     }
@@ -424,26 +420,42 @@ impl PitchHelperApp {
     }
 
     fn update_practice(&mut self, now: Instant) {
-        if let Some(session) = self.warmup.as_mut()
-            && !self.tone_player.is_playing()
-        {
-            (session.tonic, session.direction) = next_warmup_tonic(
-                session.tonic,
-                session.direction,
-                session.low_tonic,
-                session.high_tonic,
-            );
-            session.notes = warmup_notes(session.pattern, session.tonic);
-            session.note_duration = exercise_note_duration(self.bpm);
-            if let Err(message) =
-                self.tone_player
-                    .play_notes(&session.notes, session.note_duration, 0.25)
-            {
-                self.warmup = None;
-                self.error = Some(message);
-            } else {
-                session.started_at = now;
-                self.history.clear();
+        if let Some(session) = self.warmup.as_mut() {
+            if let Some(countdown_started_at) = session.countdown_started_at {
+                if now.duration_since(countdown_started_at)
+                    >= Duration::from_secs(COUNTDOWN_SECONDS)
+                {
+                    session.countdown_started_at = None;
+                    session.note_duration = exercise_note_duration(self.bpm);
+                    if let Err(message) =
+                        self.tone_player
+                            .play_notes(&session.notes, session.note_duration, 0.25)
+                    {
+                        self.warmup = None;
+                        self.error = Some(message);
+                    } else {
+                        session.started_at = now;
+                    }
+                }
+            } else if !self.tone_player.is_playing() {
+                (session.tonic, session.direction) = next_warmup_tonic(
+                    session.tonic,
+                    session.direction,
+                    session.low_tonic,
+                    session.high_tonic,
+                );
+                session.notes = warmup_notes(session.pattern, session.tonic);
+                session.note_duration = exercise_note_duration(self.bpm);
+                if let Err(message) =
+                    self.tone_player
+                        .play_notes(&session.notes, session.note_duration, 0.25)
+                {
+                    self.warmup = None;
+                    self.error = Some(message);
+                } else {
+                    session.started_at = now;
+                    self.history.clear();
+                }
             }
         }
 
@@ -452,8 +464,7 @@ impl PitchHelperApp {
         };
         match session.phase {
             EchoPhase::Countdown => {
-                if now.duration_since(session.started_at)
-                    >= Duration::from_secs(ECHO_COUNTDOWN_SECONDS)
+                if now.duration_since(session.started_at) >= Duration::from_secs(COUNTDOWN_SECONDS)
                 {
                     session.note_duration = exercise_note_duration(self.bpm);
                     if let Err(message) =
@@ -478,8 +489,7 @@ impl PitchHelperApp {
                 return;
             }
             EchoPhase::Pause => {
-                if now.duration_since(session.started_at)
-                    >= Duration::from_secs(ECHO_COUNTDOWN_SECONDS)
+                if now.duration_since(session.started_at) >= Duration::from_secs(COUNTDOWN_SECONDS)
                 {
                     session.phase = EchoPhase::Responding;
                     session.started_at = now;
@@ -942,23 +952,9 @@ fn practice_phase(now: Instant, started_at: Instant, note_duration: Duration) ->
     (now.duration_since(started_at).as_secs_f32() / total_seconds).clamp(0.0, 1.0)
 }
 
-fn echo_sequence_phase(
-    now: Instant,
-    started_at: Instant,
-    note_duration: Duration,
-    note_count: usize,
-) -> f32 {
-    let total_seconds = note_duration.as_secs_f32() * note_count as f32;
-    if total_seconds <= 0.0 {
-        return 0.0;
-    }
-    (now.duration_since(started_at).as_secs_f32() / total_seconds).clamp(0.0, 1.0)
-}
-
-fn echo_countdown_value(elapsed: Duration) -> Option<u8> {
+fn countdown_value(elapsed: Duration) -> Option<u8> {
     let elapsed_seconds = elapsed.as_secs();
-    (elapsed_seconds < ECHO_COUNTDOWN_SECONDS)
-        .then_some((ECHO_COUNTDOWN_SECONDS - elapsed_seconds) as u8)
+    (elapsed_seconds < COUNTDOWN_SECONDS).then_some((COUNTDOWN_SECONDS - elapsed_seconds) as u8)
 }
 
 fn draw_target_notes(
@@ -1108,7 +1104,8 @@ fn should_show_scrub_preview(cursor_x: f32, start_x: f32, end_x: f32) -> bool {
 fn graph_range_for_zoom(min_note: f32, max_note: f32, zoom_scale: f32) -> (f32, f32) {
     let zoom_scale = zoom_scale.clamp(0.5, 2.0);
     let center = (min_note + max_note) * 0.5;
-    let span = (BASE_GRAPH_VIEW_SPAN / (zoom_scale * 2.0)).min((max_note - min_note).max(0.0));
+    let range = (max_note - min_note).max(0.0);
+    let span = (range * 0.5 / zoom_scale).min(range);
     (center - span * 0.5, center + span * 0.5)
 }
 
@@ -1158,8 +1155,8 @@ fn zoom_label(zoom_scale: f32) -> String {
 mod tests {
     use super::{
         DEFAULT_RANGE_SENSITIVITY, LoopHandle, WarmupPattern, advance_beat_position,
-        advance_song_beat_position, centered_graph_range, clamp_graph_center, echo_countdown_value,
-        echo_sequence_phase, exercise_note_duration, follow_graph_center, format_track_time,
+        advance_song_beat_position, centered_graph_range, clamp_graph_center, countdown_value,
+        exercise_note_duration, follow_graph_center, format_track_time,
         graph_high_note_choices, graph_low_note_choices, graph_range_for_zoom, measure_phase,
         move_loop_handle, next_warmup_tonic, practice_phase, range_sample_is_eligible,
         root_note_choices, should_show_scrub_preview, warmup_notes, zoom_label,
@@ -1189,13 +1186,14 @@ mod tests {
     }
 
     #[test]
-    fn zoom_scale_is_independent_of_bounds_when_the_selected_range_is_wide_enough() {
+    fn zoom_scale_is_relative_to_the_selected_bounds() {
         assert_eq!(graph_range_for_zoom(24.0, 96.0, 0.5), (24.0, 96.0));
         assert_eq!(graph_range_for_zoom(24.0, 96.0, 1.0), (42.0, 78.0));
         assert_eq!(graph_range_for_zoom(24.0, 96.0, 2.0), (51.0, 69.0));
-        assert_eq!(graph_range_for_zoom(36.0, 96.0, 1.0), (48.0, 84.0));
-        assert_eq!(graph_range_for_zoom(12.0, 120.0, 0.5), (30.0, 102.0));
-        assert_eq!(graph_range_for_zoom(24.0, 60.0, 1.0), (24.0, 60.0));
+        assert_eq!(graph_range_for_zoom(36.0, 96.0, 0.5), (36.0, 96.0));
+        assert_eq!(graph_range_for_zoom(36.0, 96.0, 1.0), (51.0, 81.0));
+        assert_eq!(graph_range_for_zoom(12.0, 120.0, 0.5), (12.0, 120.0));
+        assert_eq!(graph_range_for_zoom(24.0, 60.0, 1.0), (33.0, 51.0));
         assert_eq!(zoom_label(1.0), "1x");
     }
 
@@ -1285,39 +1283,41 @@ mod tests {
     }
 
     #[test]
-    fn echo_progress_spans_only_the_sequence_duration_and_holds_at_the_end() {
+    fn echo_progress_uses_the_same_graph_tempo_as_warmup() {
         let started_at = std::time::Instant::now();
         let note_duration = Duration::from_millis(500);
-        assert_eq!(
-            echo_sequence_phase(started_at, started_at, note_duration, 4),
-            0.0
-        );
-        assert_eq!(
-            echo_sequence_phase(
+        // Echo and warmup share practice_phase, so each note occupies one
+        // beat (1/16 of the four-bar graph) and the playhead scrolls at the
+        // slider tempo instead of stretching the sequence across the graph.
+        assert_eq!(practice_phase(started_at, started_at, note_duration), 0.0);
+        assert!(
+            (practice_phase(
                 started_at + Duration::from_secs(1),
                 started_at,
-                note_duration,
-                4,
-            ),
-            0.5
+                note_duration
+            )
+            - 0.125)
+                .abs()
+                < 0.001
         );
-        assert_eq!(
-            echo_sequence_phase(
+        assert!(
+            (practice_phase(
                 started_at + Duration::from_secs(3),
                 started_at,
-                note_duration,
-                4,
-            ),
-            1.0
+                note_duration
+            )
+            - 0.375)
+                .abs()
+                < 0.001
         );
     }
 
     #[test]
-    fn pitch_echo_countdown_shows_three_two_one_then_finishes() {
-        assert_eq!(echo_countdown_value(Duration::ZERO), Some(3));
-        assert_eq!(echo_countdown_value(Duration::from_millis(1_500)), Some(2));
-        assert_eq!(echo_countdown_value(Duration::from_millis(2_500)), Some(1));
-        assert_eq!(echo_countdown_value(Duration::from_secs(3)), None);
+    fn practice_countdown_shows_three_two_one_then_finishes() {
+        assert_eq!(countdown_value(Duration::ZERO), Some(3));
+        assert_eq!(countdown_value(Duration::from_millis(1_500)), Some(2));
+        assert_eq!(countdown_value(Duration::from_millis(2_500)), Some(1));
+        assert_eq!(countdown_value(Duration::from_secs(3)), None);
     }
 
     #[test]
