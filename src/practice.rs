@@ -42,6 +42,7 @@ pub struct PitchMetrics {
     pub width_semitones: f32,
     pub vibrato_hz: Option<f32>,
     pub steady: bool,
+    pub sample_span: Duration,
 }
 
 pub fn pitch_metrics(samples: &[(Instant, f32)], now: Instant) -> Option<PitchMetrics> {
@@ -82,16 +83,18 @@ pub fn pitch_metrics(samples: &[(Instant, f32)], now: Instant) -> Option<PitchMe
         .iter()
         .filter(|(time, _)| *time >= cutoff)
         .map(|(time, _)| *time);
-    let span = sample_times
+    let sample_span = sample_times
         .next()
         .zip(sample_times.next_back())
-        .map(|(start, end)| end.duration_since(start).as_secs_f32())
+        .map(|(start, end)| end.duration_since(start))
         .unwrap_or_default();
+    let span = sample_span.as_secs_f32();
     let vibrato_hz = (crossings >= 4 && span > 0.2).then_some(crossings as f32 / (2.0 * span));
     Some(PitchMetrics {
         width_semitones,
         vibrato_hz,
         steady: width_semitones <= 0.25,
+        sample_span,
     })
 }
 

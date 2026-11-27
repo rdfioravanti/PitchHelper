@@ -9,6 +9,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crate::pitch::{self, PitchReading};
 
 const BUFFER_CAPACITY: usize = 8192;
+const MONITOR_BUFFER_CAPACITY: usize = 2048;
 const STOPPED: u8 = 0;
 const STARTING: u8 = 1;
 const RUNNING: u8 = 2;
@@ -46,6 +47,10 @@ pub struct Microphone {
     stop_signal: Arc<AtomicBool>,
     status: Arc<AtomicU8>,
     samples: Arc<Mutex<VecDeque<f32>>>,
+    monitor_samples: Arc<Mutex<VecDeque<f32>>>,
+    monitor_enabled: Arc<AtomicBool>,
+    monitor_sample_rate: Arc<AtomicU32>,
+    monitor_stream: Option<cpal::Stream>,
     analysis: Arc<Mutex<AudioAnalysis>>,
     sensitivity_threshold: Arc<AtomicU32>,
     last_error: Arc<Mutex<Option<String>>>,
@@ -58,6 +63,10 @@ impl Microphone {
             stop_signal: Arc::new(AtomicBool::new(true)),
             status: Arc::new(AtomicU8::new(STOPPED)),
             samples: Arc::new(Mutex::new(VecDeque::with_capacity(BUFFER_CAPACITY))),
+            monitor_samples: Arc::new(Mutex::new(VecDeque::with_capacity(MONITOR_BUFFER_CAPACITY))),
+            monitor_enabled: Arc::new(AtomicBool::new(false)),
+            monitor_sample_rate: Arc::new(AtomicU32::new(0)),
+            monitor_stream: None,
             analysis: Arc::new(Mutex::new(AudioAnalysis::default())),
             sensitivity_threshold: Arc::new(AtomicU32::new(
                 pitch::sensitivity_threshold(80.0).to_bits(),
@@ -112,6 +121,150 @@ impl Microphone {
         );
     }
 
+    pub fn is_monitoring(&self) -> bool {
+        self.monitor_enabled.load(Ordering::Acquire)
+    }
+
+    pub fn set_monitoring(&mut self, enabled: bool) -> Result<(), String> {
+        if !enabled {
+            self.monitor_enabled.store(false, Ordering::Release);
+            self.monitor_stream = None;
+            if let Ok(mut samples) = self.monitor_samples.lock() {
+                samples.clear();
+            }
+            return Ok(());
+        }
+        if !self.is_running() {
+            return Err("Start microphone input before enabling monitoring.".to_owned());
+        }
+        if self.monitor_stream.is_some() {
+            return Ok(());
+        }
+
+        let input_sample_rate = self.monitor_sample_rate.load(Ordering::Acquire);
+        if input_sample_rate == 0 {
+            return Err("Could not read the microphone sample rate for monitoring.".to_owned());
+        }
+
+        let host = cpal::default_host();
+        let device = host
+            .default_output_device()
+            .ok_or_else(|| "No output device is available for microphone monitoring.".to_owned())?;
+        let supported_config = device
+            .default_output_config()
+            .map_err(|error| format!("Could not read output settings: {error}"))?;
+        let config: cpal::StreamConfig = supported_config.clone().into();
+        let channels = config.channels as usize;
+        let output_sample_rate = config.sample_rate.0;
+        if channels == 0 || output_sample_rate == 0 {
+            return Err("The selected output device has an invalid audio format.".to_owned());
+        }
+        let stream = match supported_config.sample_format() {
+            cpal::SampleFormat::F32 => build_monitor_stream::<f32>(
+                &device,
+                &config,
+                channels,
+                input_sample_rate,
+                output_sample_rate,
+                Arc::clone(&self.monitor_samples),
+                |sample| sample.clamp(-1.0, 1.0),
+            ),
+            cpal::SampleFormat::F64 => build_monitor_stream::<f64>(
+                &device,
+                &config,
+                channels,
+                input_sample_rate,
+                output_sample_rate,
+                Arc::clone(&self.monitor_samples),
+                |sample| sample.clamp(-1.0, 1.0) as f64,
+            ),
+            cpal::SampleFormat::I8 => build_monitor_stream::<i8>(
+                &device,
+                &config,
+                channels,
+                input_sample_rate,
+                output_sample_rate,
+                Arc::clone(&self.monitor_samples),
+                |sample| (sample.clamp(-1.0, 1.0) * i8::MAX as f32) as i8,
+            ),
+            cpal::SampleFormat::I16 => build_monitor_stream::<i16>(
+                &device,
+                &config,
+                channels,
+                input_sample_rate,
+                output_sample_rate,
+                Arc::clone(&self.monitor_samples),
+                |sample| (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16,
+            ),
+            cpal::SampleFormat::I32 => build_monitor_stream::<i32>(
+                &device,
+                &config,
+                channels,
+                input_sample_rate,
+                output_sample_rate,
+                Arc::clone(&self.monitor_samples),
+                |sample| (sample.clamp(-1.0, 1.0) * i32::MAX as f32) as i32,
+            ),
+            cpal::SampleFormat::I64 => build_monitor_stream::<i64>(
+                &device,
+                &config,
+                channels,
+                input_sample_rate,
+                output_sample_rate,
+                Arc::clone(&self.monitor_samples),
+                |sample| (sample.clamp(-1.0, 1.0) as f64 * i64::MAX as f64) as i64,
+            ),
+            cpal::SampleFormat::U8 => build_monitor_stream::<u8>(
+                &device,
+                &config,
+                channels,
+                input_sample_rate,
+                output_sample_rate,
+                Arc::clone(&self.monitor_samples),
+                |sample| ((sample.clamp(-1.0, 1.0) + 1.0) * 0.5 * u8::MAX as f32) as u8,
+            ),
+            cpal::SampleFormat::U16 => build_monitor_stream::<u16>(
+                &device,
+                &config,
+                channels,
+                input_sample_rate,
+                output_sample_rate,
+                Arc::clone(&self.monitor_samples),
+                |sample| ((sample.clamp(-1.0, 1.0) + 1.0) * 0.5 * u16::MAX as f32) as u16,
+            ),
+            cpal::SampleFormat::U32 => build_monitor_stream::<u32>(
+                &device,
+                &config,
+                channels,
+                input_sample_rate,
+                output_sample_rate,
+                Arc::clone(&self.monitor_samples),
+                |sample| ((sample.clamp(-1.0, 1.0) as f64 + 1.0) * 0.5 * u32::MAX as f64) as u32,
+            ),
+            cpal::SampleFormat::U64 => build_monitor_stream::<u64>(
+                &device,
+                &config,
+                channels,
+                input_sample_rate,
+                output_sample_rate,
+                Arc::clone(&self.monitor_samples),
+                |sample| ((sample.clamp(-1.0, 1.0) as f64 + 1.0) * 0.5 * u64::MAX as f64) as u64,
+            ),
+            format => {
+                return Err(format!(
+                    "Microphone monitoring does not support output format {format:?}."
+                ));
+            }
+        }
+        .map_err(|error| format!("Could not create microphone monitor output: {error}"))?;
+        stream
+            .play()
+            .map_err(|error| format!("Could not play microphone monitoring: {error}"))?;
+        self.monitor_enabled.store(true, Ordering::Release);
+        self.monitor_stream = Some(stream);
+        Ok(())
+    }
+
     pub fn take_error(&self) -> Option<String> {
         self.last_error.lock().ok()?.take()
     }
@@ -136,6 +289,9 @@ impl Microphone {
 
         let device = Arc::clone(&input.device);
         let samples = Arc::clone(&self.samples);
+        let monitor_samples = Arc::clone(&self.monitor_samples);
+        let monitor_enabled = Arc::clone(&self.monitor_enabled);
+        let monitor_sample_rate = Arc::clone(&self.monitor_sample_rate);
         let analysis = Arc::clone(&self.analysis);
         let threshold = Arc::clone(&self.sensitivity_threshold);
         let stop_signal = Arc::new(AtomicBool::new(false));
@@ -148,7 +304,12 @@ impl Microphone {
         let worker = thread::Builder::new()
             .name("pitchhelper-microphone".to_owned())
             .spawn(move || {
-                let (stream, sample_rate) = match make_input_stream(&device, &samples) {
+                let (stream, sample_rate) = match make_input_stream(
+                    &device,
+                    &samples,
+                    &monitor_samples,
+                    &monitor_enabled,
+                ) {
                     Ok(stream) => stream,
                     Err(error) => {
                         set_worker_error(&worker_error, error);
@@ -156,6 +317,7 @@ impl Microphone {
                         return;
                     }
                 };
+                monitor_sample_rate.store(sample_rate, Ordering::Release);
                 if let Err(error) = stream.play() {
                     set_worker_error(
                         &worker_error,
@@ -215,6 +377,12 @@ impl Microphone {
     }
 
     pub fn stop(&mut self) {
+        self.monitor_enabled.store(false, Ordering::Release);
+        self.monitor_stream = None;
+        self.monitor_sample_rate.store(0, Ordering::Release);
+        if let Ok(mut samples) = self.monitor_samples.lock() {
+            samples.clear();
+        }
         self.stop_signal.store(true, Ordering::Release);
         self.status.store(STOPPED, Ordering::Release);
         if let Some(worker) = self.worker.take() {
@@ -245,6 +413,8 @@ fn set_worker_error(error_slot: &Mutex<Option<String>>, message: String) {
 fn make_input_stream(
     device: &cpal::Device,
     samples: &Arc<Mutex<VecDeque<f32>>>,
+    monitor_samples: &Arc<Mutex<VecDeque<f32>>>,
+    monitor_enabled: &Arc<AtomicBool>,
 ) -> Result<(cpal::Stream, u32), String> {
     let supported_config = device
         .default_input_config()
@@ -253,52 +423,96 @@ fn make_input_stream(
     let channels = config.channels as usize;
     let sample_rate = config.sample_rate.0;
     let stream = match supported_config.sample_format() {
-        cpal::SampleFormat::F32 => {
-            build_input_stream::<f32>(device, &config, channels, samples, |v| v)
-        }
-        cpal::SampleFormat::F64 => {
-            build_input_stream::<f64>(device, &config, channels, samples, |v| v as f32)
-        }
-        cpal::SampleFormat::I8 => {
-            build_input_stream::<i8>(device, &config, channels, samples, |v| {
-                v as f32 / i8::MAX as f32
-            })
-        }
-        cpal::SampleFormat::I16 => {
-            build_input_stream::<i16>(device, &config, channels, samples, |v| {
-                v as f32 / i16::MAX as f32
-            })
-        }
-        cpal::SampleFormat::I32 => {
-            build_input_stream::<i32>(device, &config, channels, samples, |v| {
-                v as f32 / i32::MAX as f32
-            })
-        }
-        cpal::SampleFormat::I64 => {
-            build_input_stream::<i64>(device, &config, channels, samples, |v| {
-                v as f32 / i64::MAX as f32
-            })
-        }
-        cpal::SampleFormat::U8 => {
-            build_input_stream::<u8>(device, &config, channels, samples, |v| {
-                (v as f32 / u8::MAX as f32) * 2.0 - 1.0
-            })
-        }
-        cpal::SampleFormat::U16 => {
-            build_input_stream::<u16>(device, &config, channels, samples, |v| {
-                (v as f32 / u16::MAX as f32) * 2.0 - 1.0
-            })
-        }
-        cpal::SampleFormat::U32 => {
-            build_input_stream::<u32>(device, &config, channels, samples, |v| {
-                (v as f64 / u32::MAX as f64 * 2.0 - 1.0) as f32
-            })
-        }
-        cpal::SampleFormat::U64 => {
-            build_input_stream::<u64>(device, &config, channels, samples, |v| {
-                (v as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32
-            })
-        }
+        cpal::SampleFormat::F32 => build_input_stream::<f32>(
+            device,
+            &config,
+            channels,
+            samples,
+            monitor_samples,
+            monitor_enabled,
+            |v| v,
+        ),
+        cpal::SampleFormat::F64 => build_input_stream::<f64>(
+            device,
+            &config,
+            channels,
+            samples,
+            monitor_samples,
+            monitor_enabled,
+            |v| v as f32,
+        ),
+        cpal::SampleFormat::I8 => build_input_stream::<i8>(
+            device,
+            &config,
+            channels,
+            samples,
+            monitor_samples,
+            monitor_enabled,
+            |v| v as f32 / i8::MAX as f32,
+        ),
+        cpal::SampleFormat::I16 => build_input_stream::<i16>(
+            device,
+            &config,
+            channels,
+            samples,
+            monitor_samples,
+            monitor_enabled,
+            |v| v as f32 / i16::MAX as f32,
+        ),
+        cpal::SampleFormat::I32 => build_input_stream::<i32>(
+            device,
+            &config,
+            channels,
+            samples,
+            monitor_samples,
+            monitor_enabled,
+            |v| v as f32 / i32::MAX as f32,
+        ),
+        cpal::SampleFormat::I64 => build_input_stream::<i64>(
+            device,
+            &config,
+            channels,
+            samples,
+            monitor_samples,
+            monitor_enabled,
+            |v| v as f32 / i64::MAX as f32,
+        ),
+        cpal::SampleFormat::U8 => build_input_stream::<u8>(
+            device,
+            &config,
+            channels,
+            samples,
+            monitor_samples,
+            monitor_enabled,
+            |v| (v as f32 / u8::MAX as f32) * 2.0 - 1.0,
+        ),
+        cpal::SampleFormat::U16 => build_input_stream::<u16>(
+            device,
+            &config,
+            channels,
+            samples,
+            monitor_samples,
+            monitor_enabled,
+            |v| (v as f32 / u16::MAX as f32) * 2.0 - 1.0,
+        ),
+        cpal::SampleFormat::U32 => build_input_stream::<u32>(
+            device,
+            &config,
+            channels,
+            samples,
+            monitor_samples,
+            monitor_enabled,
+            |v| (v as f64 / u32::MAX as f64 * 2.0 - 1.0) as f32,
+        ),
+        cpal::SampleFormat::U64 => build_input_stream::<u64>(
+            device,
+            &config,
+            channels,
+            samples,
+            monitor_samples,
+            monitor_enabled,
+            |v| (v as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32,
+        ),
         format => {
             return Err(format!(
                 "Microphone sample format {format:?} is not supported."
@@ -314,12 +528,16 @@ fn build_input_stream<T>(
     config: &cpal::StreamConfig,
     channels: usize,
     buffer: &Arc<Mutex<VecDeque<f32>>>,
+    monitor_buffer: &Arc<Mutex<VecDeque<f32>>>,
+    monitor_enabled: &Arc<AtomicBool>,
     convert: fn(T) -> f32,
 ) -> Result<cpal::Stream, cpal::BuildStreamError>
 where
     T: cpal::SizedSample + Copy + 'static,
 {
     let buffer = Arc::clone(buffer);
+    let monitor_buffer = Arc::clone(monitor_buffer);
+    let monitor_enabled = Arc::clone(monitor_enabled);
     device.build_input_stream(
         config,
         move |data: &[T], _| {
@@ -330,14 +548,81 @@ where
                 })
                 .collect();
             if let Ok(mut samples) = buffer.lock() {
-                samples.extend(mono);
+                samples.extend(mono.iter().copied());
                 let overflow = samples.len().saturating_sub(BUFFER_CAPACITY);
+                if overflow > 0 {
+                    samples.drain(..overflow);
+                }
+            }
+            if monitor_enabled.load(Ordering::Acquire)
+                && let Ok(mut samples) = monitor_buffer.lock()
+            {
+                samples.extend(mono.iter().copied());
+                let overflow = samples.len().saturating_sub(MONITOR_BUFFER_CAPACITY);
                 if overflow > 0 {
                     samples.drain(..overflow);
                 }
             }
         },
         |error| eprintln!("Microphone stream error: {error}"),
+        None,
+    )
+}
+
+fn build_monitor_stream<T>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    channels: usize,
+    input_sample_rate: u32,
+    output_sample_rate: u32,
+    buffer: Arc<Mutex<VecDeque<f32>>>,
+    convert: fn(f32) -> T,
+) -> Result<cpal::Stream, cpal::BuildStreamError>
+where
+    T: cpal::SizedSample + Copy + 'static,
+{
+    let mut queued_samples = VecDeque::with_capacity(MONITOR_BUFFER_CAPACITY);
+    let mut previous = 0.0_f32;
+    let mut next = 0.0_f32;
+    let mut phase = 0.0_f64;
+    let mut initialized = false;
+    let sample_step = input_sample_rate as f64 / output_sample_rate as f64;
+
+    device.build_output_stream(
+        config,
+        move |data: &mut [T], _| {
+            let frame_count = data.len() / channels;
+            let advances = (phase + sample_step * frame_count as f64).floor() as usize;
+            let required_samples = advances + if initialized { 0 } else { 2 };
+            if let Ok(mut samples) = buffer.lock() {
+                while queued_samples.len() < required_samples {
+                    let Some(sample) = samples.pop_front() else {
+                        break;
+                    };
+                    queued_samples.push_back(sample);
+                }
+            }
+
+            if !initialized {
+                previous = queued_samples.pop_front().unwrap_or_default();
+                next = queued_samples.pop_front().unwrap_or_default();
+                initialized = true;
+            }
+
+            for frame in data.chunks_mut(channels) {
+                let sample = previous + (next - previous) * phase as f32;
+                for output in frame {
+                    *output = convert(sample);
+                }
+                phase += sample_step;
+                while phase >= 1.0 {
+                    phase -= 1.0;
+                    previous = next;
+                    next = queued_samples.pop_front().unwrap_or_default();
+                }
+            }
+        },
+        |error| eprintln!("Microphone monitor output error: {error}"),
         None,
     )
 }

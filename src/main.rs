@@ -23,6 +23,10 @@ const VISIBLE_BARS: f32 = 4.0;
 const CENTS_TOLERANCE: f32 = 15.0;
 const LOOP_HANDLE_HIT_RADIUS: f32 = 12.0;
 const ECHO_COUNTDOWN_SECONDS: u64 = 3;
+const DEFAULT_RANGE_SENSITIVITY: f32 = 35.0;
+const RANGE_TRACKING_MIN_RMS: f32 = 0.002;
+const RANGE_TRACKING_MAX_RMS: f32 = 0.04;
+const RANGE_TRACKING_MIN_DURATION: Duration = Duration::from_millis(400);
 const COPYRIGHT: &str = "© 2026 Richard Fioravanti";
 enum AudioLoadEvent {
     Analyzing(String),
@@ -214,6 +218,7 @@ struct PitchHelperApp {
     input_level_rms: f32,
     input_peak: f32,
     sensitivity: f32,
+    range_sensitivity: f32,
     history: VecDeque<(f32, f32)>,
     recent_pitch: VecDeque<(Instant, f32)>,
     range_tracker: RangeTracker,
@@ -302,6 +307,7 @@ impl PitchHelperApp {
             input_level_rms: 0.0,
             input_peak: 0.0,
             sensitivity: 80.0,
+            range_sensitivity: DEFAULT_RANGE_SENSITIVITY,
             history: VecDeque::new(),
             recent_pitch: VecDeque::new(),
             range_tracker,
@@ -386,6 +392,7 @@ impl PitchHelperApp {
         }
         if let Some(metrics) =
             pitch_metrics(&self.recent_pitch.iter().copied().collect::<Vec<_>>(), now)
+            && range_sample_is_eligible(analysis.rms, metrics.sample_span, self.range_sensitivity)
             && self.range_tracker.record(reading.midi, metrics.steady)
         {
             self.session_range_tracker
@@ -903,6 +910,19 @@ impl PitchHelperApp {
                         "Higher sensitivity lowers the detection threshold for quieter singing.",
                     );
                     ui.label(format!("{:.0}%", self.sensitivity));
+                    let mut monitor_enabled = self.microphone.is_monitoring();
+                    let monitor_response = ui.add_enabled(
+                        self.microphone.is_running(),
+                        egui::Checkbox::new(&mut monitor_enabled, "Monitor"),
+                    );
+                    if monitor_response.changed()
+                        && let Err(message) = self.microphone.set_monitoring(monitor_enabled)
+                    {
+                        self.error = Some(message);
+                    }
+                    monitor_response.on_hover_text(
+                        "Play microphone audio through the default output. Use headphones to prevent feedback.",
+                    );
                 });
             });
         });
@@ -1046,7 +1066,7 @@ impl PitchHelperApp {
                         match status {
                             AudioLoadStatus::ChoosingFile => {
                                 ui.label(
-                                    RichText::new("Choose an audio file…")
+                                    RichText::new("Choose an audio file...")
                                         .size(12.0)
                                         .color(Color32::from_rgb(125, 145, 161)),
                                 );
@@ -1054,7 +1074,7 @@ impl PitchHelperApp {
                             AudioLoadStatus::Analyzing(name) => {
                                 ui.spinner();
                                 ui.label(
-                                    RichText::new(format!("Analyzing {name}…"))
+                                    RichText::new(format!("Analyzing {name}..."))
                                         .size(12.0)
                                         .color(Color32::from_rgb(125, 145, 161)),
                                 );
@@ -1884,7 +1904,7 @@ impl PitchHelperApp {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui
-                        .add_enabled(self.audio_load.is_none(), egui::Button::new("Open Audio…"))
+                        .add_enabled(self.audio_load.is_none(), egui::Button::new("Open Audio"))
                         .clicked()
                     {
                         open_audio = true;
@@ -1898,25 +1918,49 @@ impl PitchHelperApp {
                     close_menu_if_pointer_left(ui, menu_bar_rect);
                 });
                 ui.menu_button("Settings", |ui| {
-                    ui.label("Appearance");
-                    ui.selectable_value(&mut self.theme, ThemeChoice::System, "System");
-                    ui.selectable_value(&mut self.theme, ThemeChoice::Light, "Light");
-                    ui.selectable_value(&mut self.theme, ThemeChoice::Dark, "Dark");
+                    ui.menu_button("Appearance", |ui| {
+                        ui.selectable_value(&mut self.theme, ThemeChoice::System, "System");
+                        ui.selectable_value(&mut self.theme, ThemeChoice::Light, "Light");
+                        ui.selectable_value(&mut self.theme, ThemeChoice::Dark, "Dark");
+                    });
+                    ui.menu_button("Range Sensitivity", |ui| {
+                        ui.label("Higher values accept quieter notes.");
+                        ui.horizontal(|ui| {
+                            ui.add_sized(
+                                [140.0, 20.0],
+                                egui::Slider::new(&mut self.range_sensitivity, 0.0..=100.0)
+                                    .step_by(1.0)
+                                    .show_value(false),
+                            )
+                            .on_hover_text(
+                                "Lower values require a louder signal. Pitches must also be sustained for at least 400 ms.",
+                            );
+                            ui.label(format!("{:.0}%", self.range_sensitivity));
+                        });
+                    });
+                    ui.menu_button("Highlight Opacity", |ui| {
+                        ui.label("Key / scale highlight strength.");
+                        ui.horizontal(|ui| {
+                            ui.add_sized(
+                                [140.0, 20.0],
+                                egui::Slider::new(&mut self.highlight_opacity, 0.0..=0.5)
+                                    .show_value(false),
+                            )
+                            .on_hover_text(
+                                "Adjusts the opacity of key and scale highlights on the graph.",
+                            );
+                            ui.label(format!("{:.0}%", self.highlight_opacity * 100.0));
+                        });
+                    });
                     ui.separator();
-                    ui.label("Key / Scale Highlight Opacity");
-                    ui.add(
-                        egui::Slider::new(&mut self.highlight_opacity, 0.0..=0.5).show_value(false),
-                    );
-                    ui.label(format!("{:.0}%", self.highlight_opacity * 100.0));
-                    ui.separator();
-                    if ui.button("Clear Range & Tessitura History…").clicked() {
+                    if ui.button("Clear Range & Tessitura History").clicked() {
                         self.clear_range_confirmation = true;
                         ui.close_menu();
                     }
                     close_menu_if_pointer_left(ui, menu_bar_rect);
                 });
                 ui.menu_button("Help", |ui| {
-                    if ui.button("About PitchHelper…").clicked() {
+                    if ui.button("About PitchHelper").clicked() {
                         self.about_open = true;
                         ui.close_menu();
                     }
@@ -1929,42 +1973,133 @@ impl PitchHelperApp {
 
     fn draw_about(&mut self, ctx: &egui::Context) {
         egui::Window::new("About PitchHelper")
+            .collapsible(false)
             .resizable(false)
             .open(&mut self.about_open)
-            .default_width(380.0)
+            .default_width(430.0)
             .show(ctx, |ui| {
+                let accent = ui.visuals().hyperlink_color;
                 ui.vertical_centered(|ui| {
-                    ui.label(RichText::new("PitchHelper").size(22.0).strong());
+                    ui.label(
+                        RichText::new("PitchHelper")
+                            .size(25.0)
+                            .strong()
+                            .color(accent),
+                    );
                     ui.label(
                         RichText::new(format!("version {}", env!("CARGO_PKG_VERSION")))
-                            .size(11.0)
-                            .color(Color32::from_rgb(125, 145, 161)),
+                            .size(12.0)
+                            .weak(),
+                    );
+                    ui.label(RichText::new("Live pitch coach for singers").size(13.0));
+                });
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                ui.label(
+                    RichText::new("GETTING STARTED")
+                        .size(12.0)
+                        .strong()
+                        .color(accent),
+                );
+                ui.label(
+                    RichText::new("Choose a microphone, then select Start Listening. The device list refreshes every two seconds.")
+                        .size(13.0),
+                );
+                ui.label(
+                    RichText::new("Raise Pitch Sensitivity if quieter singing is not detected.")
+                        .size(13.0),
+                );
+                ui.label(
+                    RichText::new(
+                        "When listening, enable Monitor to hear the microphone through your output; use headphones to prevent feedback.",
+                    )
+                    .size(13.0),
+                );
+                ui.add_space(8.0);
+
+                ui.label(
+                    RichText::new("READING THE DISPLAY")
+                        .size(12.0)
+                        .strong()
+                        .color(accent),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new("IN TUNE")
+                            .size(12.0)
+                            .strong()
+                            .color(Color32::from_rgb(54, 190, 132)),
+                    );
+                    ui.label(RichText::new("within 15 cents").size(12.0));
+                    ui.label(
+                        RichText::new("FLAT")
+                            .size(12.0)
+                            .strong()
+                            .color(Color32::from_rgb(220, 75, 75)),
+                    );
+                    ui.label(
+                        RichText::new("SHARP")
+                            .size(12.0)
+                            .strong()
+                            .color(Color32::from_rgb(80, 156, 255)),
                     );
                 });
-                ui.add_space(10.0);
-                ui.label("A live pitch coach for singers.");
+                ui.label(
+                    RichText::new("Outside exercises, the playhead cycles through four 4/4 bars. Tempo controls its pace; LOW, HIGH, and Zoom adjust the visible pitch range.")
+                        .size(13.0),
+                );
                 ui.add_space(8.0);
 
-                ui.strong("What it does");
-                ui.label("•  Tracks your live pitch — closest note and cents of tuning.");
-                ui.label("•  Plots your pitch over a moving four-bar 4/4 timeline.");
-                ui.label("•  Plays a backing track (WAV/MP3/FLAC/OGG) with an auto-detected tempo, a metronome, and a seekable waveform.");
-                ui.label("•  Practice tools: key/scale highlighting, a reference tone, warm-ups, and a pitch-echo game.");
-                ui.label("•  Tracks your vocal range and tessitura over time.");
+                ui.label(
+                    RichText::new("PLAYBACK AND PRACTICE")
+                        .size(12.0)
+                        .strong()
+                        .color(accent),
+                );
+                ui.label(
+                    RichText::new("File > Open Audio loads WAV, MP3, FLAC, or OGG. Tempo detection is a best effort; adjust it manually if needed.")
+                        .size(13.0),
+                );
+                ui.label(
+                    RichText::new("The metronome follows the graph or playing track; its higher-pitched click marks each measure's first beat.")
+                        .size(13.0),
+                );
+                ui.label(
+                    RichText::new("Key / Scale highlights notes. The shared root sets the reference tone and exercises; Warm-Up and Pitch Echo share a pattern.")
+                        .size(13.0),
+                );
+                ui.label(
+                    RichText::new("Echo plays a phrase, waits three seconds, then lets you sing it back and shows your match score.")
+                        .size(13.0),
+                );
+                ui.label(
+                    RichText::new("Drag the A/B waveform handles to loop a section; right-click for reset options.")
+                        .size(13.0),
+                );
                 ui.add_space(8.0);
 
-                ui.strong("Reading the display");
-                ui.label("•  Green = in tune (within 15 cents)   ·   Red = flat   ·   Blue = sharp");
+                ui.label(
+                    RichText::new("RANGE AND SETTINGS")
+                        .size(12.0)
+                        .strong()
+                        .color(accent),
+                );
+                ui.label(
+                    RichText::new("Session and saved global range appear beside the pitch readout. The blue band estimates the central 80% of stable pitches.")
+                        .size(13.0),
+                );
+                ui.label(
+                    RichText::new("Settings > Range Sensitivity filters quiet or brief pitch detections. Lower values require a louder signal; a pitch must last at least 400 ms.")
+                        .size(13.0),
+                );
+                ui.label(
+                    RichText::new("Appearance follows your system by default. Settings can override it, adjust scale-highlight opacity, or clear saved history.")
+                        .size(13.0),
+                );
                 ui.add_space(8.0);
-
-                ui.strong("Tips");
-                ui.label("•  Use the Pitch Sensitivity slider if the app can't hear quieter singing.");
-                ui.label("•  Choose a Key and Scale to highlight in-scale notes; chord tones are emphasized.");
-                ui.label("•  Use Zoom, LOW and HIGH to shape the graph.");
-                ui.label("•  Right-click the waveform to reset the A/B loop handles.");
-                ui.add_space(10.0);
-
-                ui.weak(COPYRIGHT);
+                ui.label(RichText::new(COPYRIGHT).size(11.0).weak());
             });
     }
 
@@ -2543,7 +2678,14 @@ fn close_menu_if_pointer_left(ui: &mut egui::Ui, menu_bar_rect: egui::Rect) {
     let menu_rect = ui.min_rect().expand(10.0);
     let pointer_inside_menu = ui
         .input(|input| input.pointer.hover_pos())
-        .is_some_and(|position| menu_rect.contains(position) || menu_bar_rect.contains(position));
+        .is_some_and(|position| {
+            menu_rect.contains(position)
+                || menu_bar_rect.contains(position)
+                || ui
+                    .ctx()
+                    .layer_id_at(position)
+                    .is_some_and(|layer_id| layer_id.order == egui::Order::Foreground)
+        });
     if !pointer_inside_menu {
         ui.close_menu();
     }
@@ -2664,6 +2806,13 @@ fn pitch_color(cents: f32) -> Color32 {
     } else {
         Color32::from_rgb(77, 151, 255)
     }
+}
+
+fn range_sample_is_eligible(rms: f32, sample_span: Duration, sensitivity: f32) -> bool {
+    let sensitivity = (sensitivity / 100.0).clamp(0.0, 1.0);
+    let minimum_rms = RANGE_TRACKING_MIN_RMS
+        + (RANGE_TRACKING_MAX_RMS - RANGE_TRACKING_MIN_RMS) * (1.0 - sensitivity).powi(2);
+    rms.is_finite() && rms >= minimum_rms && sample_span >= RANGE_TRACKING_MIN_DURATION
 }
 
 fn theme_is_dark(theme: ThemeChoice) -> bool {
@@ -2789,13 +2938,36 @@ fn zoom_label(zoom_scale: f32) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        LoopHandle, WarmupPattern, advance_beat_position, advance_song_beat_position,
-        centered_graph_range, clamp_graph_center, echo_countdown_value, echo_sequence_phase,
-        exercise_note_duration, follow_graph_center, format_track_time, graph_range_for_zoom,
-        measure_phase, move_loop_handle, next_warmup_tonic, practice_phase, root_note_choices,
-        should_show_scrub_preview, warmup_notes, zoom_label,
+        DEFAULT_RANGE_SENSITIVITY, LoopHandle, WarmupPattern, advance_beat_position,
+        advance_song_beat_position, centered_graph_range, clamp_graph_center, echo_countdown_value,
+        echo_sequence_phase, exercise_note_duration, follow_graph_center, format_track_time,
+        graph_range_for_zoom, measure_phase, move_loop_handle, next_warmup_tonic, practice_phase,
+        range_sample_is_eligible, root_note_choices, should_show_scrub_preview, warmup_notes,
+        zoom_label,
     };
     use std::time::Duration;
+
+    #[test]
+    fn range_tracking_filters_quiet_and_transient_pitch_samples() {
+        let sustained = Duration::from_millis(450);
+        assert!(!range_sample_is_eligible(
+            0.01,
+            sustained,
+            DEFAULT_RANGE_SENSITIVITY
+        ));
+        assert!(!range_sample_is_eligible(
+            0.03,
+            Duration::from_millis(350),
+            DEFAULT_RANGE_SENSITIVITY
+        ));
+        assert!(range_sample_is_eligible(
+            0.03,
+            sustained,
+            DEFAULT_RANGE_SENSITIVITY
+        ));
+        assert!(range_sample_is_eligible(0.003, sustained, 100.0));
+        assert!(!range_sample_is_eligible(0.003, sustained, 0.0));
+    }
 
     #[test]
     fn default_zoom_is_one_and_half_zoom_shows_the_full_selected_range() {
