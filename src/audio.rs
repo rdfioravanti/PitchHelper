@@ -422,6 +422,9 @@ fn make_input_stream(
     let config: cpal::StreamConfig = supported_config.clone().into();
     let channels = config.channels as usize;
     let sample_rate = config.sample_rate.0;
+    if channels == 0 || sample_rate == 0 {
+        return Err("The microphone device has an invalid audio format.".to_owned());
+    }
     let stream = match supported_config.sample_format() {
         cpal::SampleFormat::F32 => build_input_stream::<f32>(
             device,
@@ -705,6 +708,9 @@ impl Metronome {
         let config: cpal::StreamConfig = supported_config.clone().into();
         let channels = config.channels as usize;
         let sample_rate = config.sample_rate.0;
+        if channels == 0 || sample_rate == 0 {
+            return Err("The output device has an invalid audio format.".to_owned());
+        }
         let stream = match supported_config.sample_format() {
             cpal::SampleFormat::F32 => build_metronome_stream::<f32>(
                 &device,

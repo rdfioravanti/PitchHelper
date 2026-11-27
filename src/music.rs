@@ -39,8 +39,12 @@ pub fn analyze_track(path: &Path) -> Result<TrackAnalysis, String> {
         .make(&track.codec_params, &DecoderOptions::default())
         .map_err(|error| format!("Could not decode audio file: {error}"))?;
 
-    let mut mono = Vec::new();
+    let mut energy_levels = Vec::new();
     let mut sample_rate = None;
+    let mut frames_per_window = None;
+    let mut window_energy = 0.0_f64;
+    let mut window_frames = 0_usize;
+    let mut total_frames = 0_u64;
     loop {
         let packet = match format.next_packet() {
             Ok(packet) => packet,
@@ -62,24 +66,38 @@ pub fn analyze_track(path: &Path) -> Result<TrackAnalysis, String> {
         if channels == 0 {
             continue;
         }
-        sample_rate = Some(decoded.spec().rate);
+        let packet_sample_rate = decoded.spec().rate;
+        if packet_sample_rate == 0 {
+            return Err("The audio file has an invalid sample rate.".to_owned());
+        }
+        sample_rate = Some(packet_sample_rate);
+        let frames_per_window =
+            *frames_per_window.get_or_insert((packet_sample_rate / 100).max(1) as usize);
         let mut buffer = SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
         buffer.copy_interleaved_ref(decoded);
-        mono.extend(
-            buffer
-                .samples()
-                .chunks(channels)
-                .map(|frame| frame.iter().copied().sum::<f32>() / channels as f32),
-        );
+        for frame in buffer.samples().chunks(channels) {
+            let mono = frame.iter().copied().sum::<f32>() / channels as f32;
+            window_energy += f64::from(mono * mono);
+            window_frames += 1;
+            total_frames += 1;
+            if window_frames == frames_per_window {
+                energy_levels.push((window_energy / window_frames as f64).sqrt() as f32);
+                window_energy = 0.0;
+                window_frames = 0;
+            }
+        }
     }
 
     let sample_rate = sample_rate
         .ok_or_else(|| "The audio file did not contain decodable samples.".to_owned())?;
-    let duration = Duration::from_secs_f64(mono.len() as f64 / sample_rate as f64);
+    if window_frames > 0 {
+        energy_levels.push((window_energy / window_frames as f64).sqrt() as f32);
+    }
+    let duration = Duration::from_secs_f64(total_frames as f64 / sample_rate as f64);
     Ok(TrackAnalysis {
-        bpm: detect_bpm(&mono, sample_rate),
+        bpm: detect_bpm(&energy_levels),
         duration,
-        waveform: waveform_envelope(&mono, WAVEFORM_BINS),
+        waveform: waveform_envelope(&energy_levels, WAVEFORM_BINS),
     })
 }
 
@@ -110,17 +128,7 @@ fn waveform_envelope(samples: &[f32], bin_limit: usize) -> Vec<f32> {
     envelope
 }
 
-fn detect_bpm(samples: &[f32], sample_rate: u32) -> Option<f32> {
-    let hop = (sample_rate / 100).max(1) as usize;
-    let mut energy = Vec::with_capacity(samples.len() / hop);
-    for window in samples.chunks(hop) {
-        if window.is_empty() {
-            continue;
-        }
-        let rms =
-            (window.iter().map(|sample| sample * sample).sum::<f32>() / window.len() as f32).sqrt();
-        energy.push(rms);
-    }
+fn detect_bpm(energy: &[f32]) -> Option<f32> {
     if energy.len() < 200 {
         return None;
     }
@@ -194,18 +202,12 @@ mod tests {
 
     #[test]
     fn estimates_tempo_from_regular_transients() {
-        let sample_rate = 10_000_u32;
-        let beat_samples = sample_rate * 60 / 120;
-        let mut samples = vec![0.0; sample_rate as usize * 12];
-        for beat in (0..samples.len()).step_by(beat_samples as usize) {
-            for offset in 0..120 {
-                if beat + offset < samples.len() {
-                    samples[beat + offset] = 0.9 * (1.0 - offset as f32 / 120.0);
-                }
-            }
+        let mut energy = vec![0.0; 1200];
+        for beat in (0..energy.len()).step_by(50) {
+            energy[beat] = 0.9;
         }
 
-        let bpm = detect_bpm(&samples, sample_rate).expect("regular beat should be detected");
+        let bpm = detect_bpm(&energy).expect("regular beat should be detected");
         assert!((bpm - 120.0).abs() < 3.0, "expected 120 BPM, got {bpm}");
     }
 

@@ -37,6 +37,34 @@ impl Scale {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum WarmupPattern {
+    FiveTone,
+    Octave,
+    Arpeggio,
+    Siren,
+}
+
+impl WarmupPattern {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FiveTone => "5-Tone Scale",
+            Self::Octave => "Octaves",
+            Self::Arpeggio => "Arpeggio",
+            Self::Siren => "Sirens",
+        }
+    }
+
+    pub fn intervals(self) -> &'static [i32] {
+        match self {
+            Self::FiveTone => &[0, 2, 4, 5, 7, 5, 4, 2, 0],
+            Self::Octave => &[0, 12, 0, 12, 0],
+            Self::Arpeggio => &[0, 4, 7, 12, 7, 4, 0],
+            Self::Siren => &[0, 7, 12, 19, 12, 7, 0],
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PitchMetrics {
     pub width_semitones: f32,
