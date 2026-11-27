@@ -12,10 +12,14 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align, Color32, FontId, Layout, RichText, Stroke, Vec2};
 
+const APP_TITLE_SIZE: f32 = 21.0;
+const DIALOG_BODY_SIZE: f32 = 14.0;
+const SECTION_LABEL_SIZE: f32 = 10.0;
+
 impl PitchHelperApp {
     fn draw_header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("PitchHelper").size(21.0).strong());
+            ui.label(RichText::new("PitchHelper").size(APP_TITLE_SIZE).strong());
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.label(
                     RichText::new("LIVE PITCH COACH")
@@ -1078,58 +1082,75 @@ impl PitchHelperApp {
     }
 
     fn draw_about(&mut self, ctx: &egui::Context) {
-        egui::Window::new("About PitchHelper")
+        let screen_rect = ctx.screen_rect();
+        let max_content_height = (screen_rect.height() - 200.0).clamp(100.0, 560.0);
+        let about_size = Vec2::new(
+            screen_rect.width().min(430.0),
+            self.about_content_height.min(max_content_height),
+        );
+        let content_height = egui::Window::new("About PitchHelper")
             .collapsible(false)
+            .movable(false)
             .resizable(false)
+            .frame(egui::Frame::window(&ctx.style()))
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .constrain_to(screen_rect.shrink(48.0))
             .open(&mut self.about_open)
-            .default_width(430.0)
+            .fixed_size(about_size)
             .show(ctx, |ui| {
-                let accent = ui.visuals().hyperlink_color;
+                egui::ScrollArea::vertical()
+                    .id_salt("about_content")
+                    .auto_shrink([false, false])
+                    .max_height(max_content_height)
+                    .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 4.0;
+                let heading_color = Color32::from_rgb(125, 145, 161);
+                let title_color = ui.visuals().text_color();
                 ui.vertical_centered(|ui| {
                     ui.label(
                         RichText::new("PitchHelper")
-                            .size(25.0)
+                            .size(APP_TITLE_SIZE)
                             .strong()
-                            .color(accent),
+                            .color(title_color),
                     );
                     ui.label(
                         RichText::new(format!("version {}", env!("CARGO_PKG_VERSION")))
                             .size(12.0)
                             .weak(),
                     );
-                    ui.label(RichText::new("Live pitch coach for singers").size(13.0));
+                    ui.label(RichText::new("Live pitch coach for singers").size(DIALOG_BODY_SIZE));
                 });
-                ui.add_space(6.0);
+                ui.add_space(4.0);
                 ui.separator();
-                ui.add_space(6.0);
+                ui.add_space(4.0);
 
                 ui.label(
                     RichText::new("GETTING STARTED")
-                        .size(12.0)
+                        .size(SECTION_LABEL_SIZE)
                         .strong()
-                        .color(accent),
+                        .color(heading_color),
                 );
                 ui.label(
                     RichText::new("Choose a microphone, then select Start Listening. The device list refreshes every two seconds.")
-                        .size(13.0),
+                        .size(DIALOG_BODY_SIZE),
                 );
                 ui.label(
                     RichText::new("Raise Pitch Sensitivity if quieter singing is not detected.")
-                        .size(13.0),
+                        .size(DIALOG_BODY_SIZE),
                 );
                 ui.label(
                     RichText::new(
                         "When listening, enable Monitor to hear the microphone through your output; use headphones to prevent feedback.",
                     )
-                    .size(13.0),
+                    .size(DIALOG_BODY_SIZE),
                 );
-                ui.add_space(8.0);
+                ui.add_space(6.0);
 
                 ui.label(
                     RichText::new("READING THE DISPLAY")
-                        .size(12.0)
+                        .size(SECTION_LABEL_SIZE)
                         .strong()
-                        .color(accent),
+                        .color(heading_color),
                 );
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
@@ -1154,59 +1175,65 @@ impl PitchHelperApp {
                 });
                 ui.label(
                     RichText::new("Outside exercises, the playhead cycles through four 4/4 bars. Tempo controls its pace; LOW, HIGH, and Zoom adjust the visible pitch range.")
-                        .size(13.0),
+                        .size(DIALOG_BODY_SIZE),
                 );
-                ui.add_space(8.0);
+                ui.add_space(6.0);
 
                 ui.label(
                     RichText::new("PLAYBACK AND PRACTICE")
-                        .size(12.0)
+                        .size(SECTION_LABEL_SIZE)
                         .strong()
-                        .color(accent),
+                        .color(heading_color),
                 );
                 ui.label(
                     RichText::new("File > Open Audio loads WAV, MP3, FLAC, or OGG. Tempo detection is a best effort; adjust it manually if needed.")
-                        .size(13.0),
+                        .size(DIALOG_BODY_SIZE),
                 );
                 ui.label(
                     RichText::new("The metronome follows the graph or playing track; its higher-pitched click marks each measure's first beat.")
-                        .size(13.0),
+                        .size(DIALOG_BODY_SIZE),
                 );
                 ui.label(
                     RichText::new("Key / Scale highlights notes. The shared root sets the reference tone and exercises; Warm-Up and Pitch Echo share a pattern.")
-                        .size(13.0),
+                        .size(DIALOG_BODY_SIZE),
                 );
                 ui.label(
                     RichText::new("Echo plays a phrase, waits three seconds, then lets you sing it back and shows your match score.")
-                        .size(13.0),
+                        .size(DIALOG_BODY_SIZE),
                 );
                 ui.label(
                     RichText::new("Drag the A/B waveform handles to loop a section; right-click for reset options.")
-                        .size(13.0),
+                        .size(DIALOG_BODY_SIZE),
                 );
-                ui.add_space(8.0);
+                ui.add_space(6.0);
 
                 ui.label(
                     RichText::new("RANGE AND SETTINGS")
-                        .size(12.0)
+                        .size(SECTION_LABEL_SIZE)
                         .strong()
-                        .color(accent),
+                        .color(heading_color),
                 );
                 ui.label(
                     RichText::new("Session and saved global range appear beside the pitch readout. The blue band estimates the central 80% of stable pitches.")
-                        .size(13.0),
+                        .size(DIALOG_BODY_SIZE),
                 );
                 ui.label(
                     RichText::new("Settings > Range Sensitivity filters quiet or brief pitch detections. Lower values require a louder signal; a pitch must last at least 400 ms.")
-                        .size(13.0),
+                        .size(DIALOG_BODY_SIZE),
                 );
                 ui.label(
                     RichText::new("Appearance follows your system by default. Settings can override it, adjust scale-highlight opacity, or clear saved history.")
-                        .size(13.0),
+                        .size(DIALOG_BODY_SIZE),
                 );
-                ui.add_space(8.0);
+                ui.add_space(6.0);
                 ui.label(RichText::new(COPYRIGHT).size(11.0).weak());
+                    })
+                    .content_size
+                    .y
             });
+        if let Some(content_height) = content_height.and_then(|response| response.inner) {
+            self.about_content_height = content_height.clamp(100.0, 560.0);
+        }
     }
 
     fn draw_range_clear_confirmation(&mut self, ctx: &egui::Context) {
@@ -1214,14 +1241,19 @@ impl PitchHelperApp {
         let mut cancelled = false;
         egui::Window::new("Clear Range & Tessitura History?")
             .collapsible(false)
+            .movable(false)
             .resizable(false)
+            .frame(egui::Frame::window(&ctx.style()))
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .open(&mut self.clear_range_confirmation)
             .default_width(360.0)
             .show(ctx, |ui| {
                 ui.label(
-                    "This permanently removes the saved global range and tessitura history, and clears the current session values.",
+                    RichText::new(
+                        "This permanently removes the saved global range and tessitura history, and clears the current session values.",
+                    )
+                    .size(DIALOG_BODY_SIZE),
                 );
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {

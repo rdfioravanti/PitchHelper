@@ -174,6 +174,7 @@ struct PitchHelperApp {
     last_frame: Instant,
     error: Option<String>,
     about_open: bool,
+    about_content_height: f32,
     clear_range_confirmation: bool,
 }
 
@@ -254,6 +255,7 @@ impl PitchHelperApp {
             last_frame: Instant::now(),
             error: initial_error,
             about_open: false,
+            about_content_height: 560.0,
             clear_range_confirmation: false,
         };
         app.refresh_input_devices();
@@ -1038,11 +1040,14 @@ fn theme_is_dark(theme: ThemeChoice) -> bool {
 }
 
 fn set_theme(ctx: &egui::Context, dark: bool) {
-    ctx.set_visuals(if dark {
+    let mut visuals = if dark {
         egui::Visuals::dark()
     } else {
         egui::Visuals::light()
-    });
+    };
+    visuals.window_fill = visuals.panel_fill;
+    visuals.window_stroke = visuals.widgets.noninteractive.bg_stroke;
+    ctx.set_visuals(visuals);
 }
 
 fn beats_per_cycle() -> f64 {
