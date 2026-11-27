@@ -76,14 +76,16 @@ guided warm-ups, and a pitch-echo game) and quietly tracks your **vocal range** 
   emphasized (major, minor, and both pentatonic scales).
 - A reference tone on the key's root or fifth, shown as a target line.
 - **Warm-Up**: five-tone scales, octaves, arpeggios, or sirens from the shared root,
-  advancing by a semitone after each pass.
-- **Pitch Echo**: a 3–2–1 countdown, a three-note phrase to listen to, then a scored
-  response.
+  with one note per beat at the selected tempo, advancing by a semitone after each
+  pass.
+- **Pitch Echo**: choose the same patterns as Warm-Up. Each sequence begins with a
+  graph 3–2–1 countdown, followed by the phrase and a second 3–2–1 pause before you
+  sing it back. Review your score before choosing **Next Sequence**.
 
 **Track yourself**
 
-- Vocal range and tessitura, accumulated from your stable notes and saved locally so
-  your progress persists between sessions.
+- Your detected note range and an estimated tessitura, saved locally so your
+  progress persists between sessions.
 
 ## Getting started
 
@@ -156,26 +158,35 @@ accidentals (e.g. `C#`, `Db`).
 ### Practice tools
 
 Choose a **Key** and **Scale** in the Practice controls to highlight the in-scale
-note rows; chord tones are highlighted more strongly. Their subtle **4% default
-opacity** can be adjusted in **Settings**.
+note rows; chord tones are highlighted more strongly. The root-note menu lists
+every note within the selected **LOW** and **HIGH** graph bounds. The subtle
+**4% default opacity** can be adjusted in **Settings**.
 
 The **Reference Tone** control plays the selected key's **root or fifth**, shown as a
-yellow target line. The key's octave is chosen alongside its root and is shared by
-the reference tone, warm-ups, and pitch echo.
+yellow target line. The selected root note is shared by the reference tone,
+warm-ups, and pitch echo.
 
 - **Warm-Up** plays five-tone **scales, octaves, arpeggios, or sirens** from the
-  shared root (C1–C6) and moves up by a semitone after each pass. Changing the root,
-  octave, scale, or pattern stops the current warm-up.
-- **Pitch Echo** shows a **3–2–1 countdown** in the graph, plays a three-note phrase,
-  then scores the note you sing back.
+  shared root at one note per beat using the selected tempo, moving by a semitone
+  after each pass. Changing the root, scale, or pattern stops the current warm-up.
+- **Pitch Echo** lets you select a Warm-Up pattern. Every sequence begins with a
+  **3–2–1 countdown**, plays at the selected tempo, then shows another **3–2–1 pause**
+  before recording your response. Your score stays visible until you choose **Next
+  Sequence**; each next sequence transposes by a semitone.
 
 Hold a note to see the pitch-width and vibrato/stability readout.
 
 ### Vocal range & tessitura
 
-Stable notes contribute to your **vocal range** and **tessitura** display. That
-history is saved locally in your user's application data directory, so it carries
-over between sessions.
+Detected pitches update the observed low and high notes. The tessitura estimate is
+the central 80% of stable pitch samples accumulated across sessions; the blue graph
+band marks this estimate. It is recalculated from all saved samples and can move
+higher or lower as your singing changes. It describes where your pitch has been most
+stable, not a direct measurement of which notes feel comfortable or natural. Global
+saved values are always shown; the session range starts with a prompt and appears
+after the app records a pitched note. Use **Settings → Clear Range & Tessitura
+History** to erase the saved values. History is stored locally in your user's
+application data directory and carries over between sessions.
 
 ### Settings & appearance
 
@@ -194,7 +205,7 @@ with **Light** or **Dark** under **Settings → Appearance**.
 | Note range                     | C1 to above C6              | Selectable graph and practice range.                     |
 | Graph zoom                     | 1× (LOW/HIGH bounds)        | 0.5× shows the full range.                               |
 | Metronome                      | Off                         | Enable with the Metronome controls.                      |
-| Pitch Echo phrase              | 3 notes                     | After a 3–2–1 countdown.                                 |
+| Pitch Echo sequence            | Warm-Up pattern             | Score is shown until you advance to the next sequence.   |
 | Appearance                     | OS theme                    | Override with Light/Dark in Settings.                    |
 
 ## Project layout

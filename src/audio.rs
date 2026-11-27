@@ -555,7 +555,7 @@ where
                 click_remaining = click_length;
                 click_phase = 0.0;
                 let current_beat = beat_index.saturating_sub(1);
-                click_frequency = if current_beat.is_multiple_of(4) {
+                click_frequency = if is_measure_start_beat(current_beat) {
                     1600.0
                 } else {
                     1100.0
@@ -570,7 +570,7 @@ where
                         click_length = (sample_rate as f32 * 0.035) as usize;
                         click_remaining = click_length;
                         click_phase = 0.0;
-                        click_frequency = if beat_index.is_multiple_of(4) {
+                        click_frequency = if is_measure_start_beat(beat_index) {
                             1600.0
                         } else {
                             1100.0
@@ -596,9 +596,13 @@ where
     )
 }
 
+fn is_measure_start_beat(beat_position: u64) -> bool {
+    beat_position.is_multiple_of(4)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::measure_level;
+    use super::{is_measure_start_beat, measure_level};
 
     #[test]
     fn measures_rms_and_peak_for_live_input_meter() {
@@ -606,5 +610,15 @@ mod tests {
         assert!((rms - 0.35355).abs() < 0.0001);
         assert_eq!(peak, 0.5);
         assert_eq!(measure_level(&[]), (0.0, 0.0));
+    }
+
+    #[test]
+    fn metronome_accents_the_first_quarter_note_of_each_measure() {
+        assert!(is_measure_start_beat(0));
+        assert!(!is_measure_start_beat(1));
+        assert!(!is_measure_start_beat(2));
+        assert!(!is_measure_start_beat(3));
+        assert!(is_measure_start_beat(4));
+        assert!(is_measure_start_beat(8));
     }
 }

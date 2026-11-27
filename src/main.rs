@@ -24,10 +24,6 @@ const CENTS_TOLERANCE: f32 = 15.0;
 const LOOP_HANDLE_HIT_RADIUS: f32 = 12.0;
 const ECHO_COUNTDOWN_SECONDS: u64 = 3;
 const COPYRIGHT: &str = "© 2026 Richard Fioravanti";
-const KEY_NAMES: [&str; 12] = [
-    "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
-];
-
 enum AudioLoadEvent {
     Analyzing(String),
     Complete(PathBuf, Result<music::TrackAnalysis, String>),
@@ -94,10 +90,17 @@ struct WarmupSession {
 enum EchoPhase {
     Countdown,
     Prompting,
+    Pause,
     Responding,
+    Score,
 }
 
 struct EchoSession {
+    pattern: WarmupPattern,
+    tonic: i32,
+    low_tonic: i32,
+    high_tonic: i32,
+    direction: i32,
     notes: Vec<i32>,
     phase: EchoPhase,
     note_duration: Duration,
@@ -143,11 +146,15 @@ impl Drop for RepaintTicker {
 }
 
 fn main() -> eframe::Result<()> {
+    let app_icon =
+        eframe::icon_data::from_png_bytes(include_bytes!("../assets/pitchhelper-icon.png"))
+            .expect("embedded application icon should be a valid PNG");
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("PitchHelper")
+            .with_icon(Arc::new(app_icon))
             .with_inner_size([1120.0, 760.0])
-            .with_min_inner_size([760.0, 600.0]),
+            .with_min_inner_size([900.0, 600.0]),
         ..Default::default()
     };
 
@@ -189,12 +196,11 @@ struct PitchHelperApp {
     detected_bpm: Option<f32>,
     bpm_overridden: bool,
     bpm: f32,
-    key_root: usize,
+    root_note: i32,
     scale: Scale,
     reference_enabled: bool,
     reference_kind: ReferenceKind,
-    warmup_pattern: WarmupPattern,
-    root_octave: i32,
+    exercise_pattern: WarmupPattern,
     warmup: Option<WarmupSession>,
     echo: Option<EchoSession>,
     echo_score: Option<f32>,
@@ -211,12 +217,14 @@ struct PitchHelperApp {
     history: VecDeque<(f32, f32)>,
     recent_pitch: VecDeque<(Instant, f32)>,
     range_tracker: RangeTracker,
+    session_range_tracker: RangeTracker,
     range_dirty: bool,
     last_range_save: Instant,
     graph_min_limit: f32,
     graph_max_limit: f32,
     zoom_scale: f32,
     graph_center: f32,
+    center_on_root: bool,
     highlight_opacity: f32,
     beat_position: f64,
     last_song_position: f64,
@@ -225,6 +233,7 @@ struct PitchHelperApp {
     last_frame: Instant,
     error: Option<String>,
     about_open: bool,
+    clear_range_confirmation: bool,
 }
 
 impl PitchHelperApp {
@@ -275,12 +284,11 @@ impl PitchHelperApp {
             detected_bpm: None,
             bpm_overridden: false,
             bpm: 100.0,
-            key_root: 0,
+            root_note: 60,
             scale: Scale::Major,
             reference_enabled: false,
             reference_kind: ReferenceKind::Root,
-            warmup_pattern: WarmupPattern::FiveTone,
-            root_octave: 4,
+            exercise_pattern: WarmupPattern::FiveTone,
             warmup: None,
             echo: None,
             echo_score: None,
@@ -297,12 +305,14 @@ impl PitchHelperApp {
             history: VecDeque::new(),
             recent_pitch: VecDeque::new(),
             range_tracker,
+            session_range_tracker: RangeTracker::default(),
             range_dirty: false,
             last_range_save: Instant::now(),
             graph_min_limit: 24.0,
             graph_max_limit: 96.0,
             zoom_scale: 1.0,
             graph_center: 60.0,
+            center_on_root: true,
             highlight_opacity: 0.04,
             beat_position: 0.0,
             last_song_position: 0.0,
@@ -311,6 +321,7 @@ impl PitchHelperApp {
             last_frame: Instant::now(),
             error: initial_error,
             about_open: false,
+            clear_range_confirmation: false,
         })
     }
 
@@ -341,8 +352,11 @@ impl PitchHelperApp {
             None
         } else if let Some(session) = &self.echo {
             match session.phase {
-                EchoPhase::Countdown | EchoPhase::Prompting => None,
-                EchoPhase::Responding => Some(practice_phase(
+                EchoPhase::Countdown
+                | EchoPhase::Prompting
+                | EchoPhase::Pause
+                | EchoPhase::Score => None,
+                EchoPhase::Responding => Some(echo_sequence_phase(
                     now,
                     session.started_at,
                     session.note_duration,
@@ -354,7 +368,6 @@ impl PitchHelperApp {
                 now,
                 session.started_at,
                 session.note_duration,
-                session.notes.len(),
             ))
         } else {
             Some(self.measure_phase)
@@ -371,9 +384,12 @@ impl PitchHelperApp {
         }) {
             self.recent_pitch.pop_front();
         }
-        if pitch_metrics(&self.recent_pitch.iter().copied().collect::<Vec<_>>(), now)
-            .is_some_and(|metrics| self.range_tracker.record(reading.midi, metrics.steady))
+        if let Some(metrics) =
+            pitch_metrics(&self.recent_pitch.iter().copied().collect::<Vec<_>>(), now)
+            && self.range_tracker.record(reading.midi, metrics.steady)
         {
+            self.session_range_tracker
+                .record(reading.midi, metrics.steady);
             self.range_dirty = true;
         }
     }
@@ -387,7 +403,7 @@ impl PitchHelperApp {
     }
 
     fn reference_midi(&self) -> i32 {
-        let root = root_midi(self.key_root, self.root_octave);
+        let root = self.root_note;
         match self.reference_kind {
             ReferenceKind::Root => root,
             ReferenceKind::Fifth => root + 7,
@@ -401,16 +417,16 @@ impl PitchHelperApp {
         self.echo_score = None;
         self.echo_notes = None;
         self.history.clear();
-        let tonic = root_midi(self.key_root, self.root_octave);
-        let notes = warmup_notes(self.warmup_pattern, tonic);
-        let note_duration = Duration::from_millis(450);
+        let tonic = self.root_note;
+        let notes = warmup_notes(self.exercise_pattern, tonic);
+        let note_duration = exercise_note_duration(self.bpm);
         if let Err(message) = self.tone_player.play_notes(&notes, note_duration, 0.25) {
             self.warmup = None;
             self.error = Some(message);
             return;
         }
         self.warmup = Some(WarmupSession {
-            pattern: self.warmup_pattern,
+            pattern: self.exercise_pattern,
             tonic,
             low_tonic: tonic,
             high_tonic: tonic + 12,
@@ -427,18 +443,50 @@ impl PitchHelperApp {
         self.warmup = None;
         self.echo_score = None;
         self.history.clear();
-        let tonic = root_midi(self.key_root, self.root_octave);
-        let intervals = self.scale.intervals();
-        let notes = vec![tonic, tonic + intervals[1], tonic + intervals[2]];
-        let note_duration = Duration::from_millis(450);
+        let tonic = self.root_note;
+        let notes = warmup_notes(self.exercise_pattern, tonic);
+        let note_duration = exercise_note_duration(self.bpm);
         self.echo_notes = Some(notes.clone());
         self.echo = Some(EchoSession {
+            pattern: self.exercise_pattern,
+            tonic,
+            low_tonic: tonic,
+            high_tonic: tonic + 12,
+            direction: 1,
             responses: vec![Vec::new(); notes.len()],
             notes,
             phase: EchoPhase::Countdown,
             note_duration,
             started_at: Instant::now(),
         });
+    }
+
+    fn start_next_echo_sequence(&mut self) {
+        let Some(session) = self.echo.as_ref() else {
+            return;
+        };
+        let (tonic, direction) = next_warmup_tonic(
+            session.tonic,
+            session.direction,
+            session.low_tonic,
+            session.high_tonic,
+        );
+        let pattern = session.pattern;
+        let note_duration = exercise_note_duration(self.bpm);
+        let notes = warmup_notes(pattern, tonic);
+
+        if let Some(session) = self.echo.as_mut() {
+            session.tonic = tonic;
+            session.direction = direction;
+            session.notes = notes.clone();
+            session.responses = vec![Vec::new(); notes.len()];
+            session.phase = EchoPhase::Countdown;
+            session.note_duration = note_duration;
+            session.started_at = Instant::now();
+        }
+        self.echo_score = None;
+        self.echo_notes = Some(notes);
+        self.history.clear();
     }
 
     fn update_practice(&mut self, now: Instant) {
@@ -452,6 +500,7 @@ impl PitchHelperApp {
                 session.high_tonic,
             );
             session.notes = warmup_notes(session.pattern, session.tonic);
+            session.note_duration = exercise_note_duration(self.bpm);
             if let Err(message) =
                 self.tone_player
                     .play_notes(&session.notes, session.note_duration, 0.25)
@@ -472,6 +521,7 @@ impl PitchHelperApp {
                 if now.duration_since(session.started_at)
                     >= Duration::from_secs(ECHO_COUNTDOWN_SECONDS)
                 {
+                    session.note_duration = exercise_note_duration(self.bpm);
                     if let Err(message) =
                         self.tone_player
                             .play_notes(&session.notes, session.note_duration, 0.25)
@@ -488,12 +538,23 @@ impl PitchHelperApp {
             }
             EchoPhase::Prompting => {
                 if !self.tone_player.is_playing() {
+                    session.phase = EchoPhase::Pause;
+                    session.started_at = now;
+                    self.history.clear();
+                }
+                return;
+            }
+            EchoPhase::Pause => {
+                if now.duration_since(session.started_at)
+                    >= Duration::from_secs(ECHO_COUNTDOWN_SECONDS)
+                {
                     session.phase = EchoPhase::Responding;
                     session.started_at = now;
                     self.history.clear();
                 }
                 return;
             }
+            EchoPhase::Score => return,
             EchoPhase::Responding => {}
         }
         let elapsed = now.duration_since(session.started_at);
@@ -516,7 +577,7 @@ impl PitchHelperApp {
             }
             self.echo_score =
                 Some((100.0 - error_sum / session.notes.len() as f32 * 50.0).clamp(0.0, 100.0));
-            self.echo = None;
+            session.phase = EchoPhase::Score;
         }
     }
 
@@ -531,6 +592,21 @@ impl PitchHelperApp {
                     self.error = Some(format!("Could not save vocal range: {error}"));
                     self.last_range_save = now;
                 }
+            }
+        }
+    }
+
+    fn clear_range_history(&mut self) {
+        match RangeTracker::clear_saved() {
+            Ok(()) => {
+                self.range_tracker = RangeTracker::default();
+                self.session_range_tracker = RangeTracker::default();
+                self.range_dirty = false;
+                self.last_range_save = Instant::now();
+                self.clear_range_confirmation = false;
+            }
+            Err(error) => {
+                self.error = Some(format!("Could not clear range history: {error}"));
             }
         }
     }
@@ -550,7 +626,14 @@ impl PitchHelperApp {
         if span <= 0.0 {
             return;
         }
-        let target_center = if let Some(target_center) = self.practice_target_center() {
+        let target_center = if self.center_on_root {
+            self.center_on_root = false;
+            let target = match self.practice_target_center() {
+                Some(target) => target,
+                None => self.root_note as f32,
+            };
+            clamp_graph_center(self.graph_min_limit, self.graph_max_limit, span, target)
+        } else if let Some(target_center) = self.practice_target_center() {
             clamp_graph_center(
                 self.graph_min_limit,
                 self.graph_max_limit,
@@ -617,6 +700,8 @@ impl PitchHelperApp {
     }
 
     fn draw_controls(&mut self, ui: &mut egui::Ui) {
+        let previous_graph_min = self.graph_min_limit;
+        let previous_graph_max = self.graph_max_limit;
         ui.horizontal_wrapped(|ui| {
             ui.label(
                 RichText::new("TEMPO")
@@ -678,7 +763,7 @@ impl PitchHelperApp {
                 .selected_text(midi_to_note(lowest).1)
                 .width(64.0)
                 .show_ui(ui, |ui| {
-                    for midi in 12..=60 {
+                    for midi in 12..=self.graph_max_limit.floor() as i32 {
                         ui.selectable_value(
                             &mut lowest,
                             midi as f32,
@@ -699,7 +784,7 @@ impl PitchHelperApp {
                 .selected_text(midi_to_note(highest).1)
                 .width(64.0)
                 .show_ui(ui, |ui| {
-                    for midi in 84..=120 {
+                    for midi in self.graph_min_limit.ceil() as i32..=120 {
                         ui.selectable_value(
                             &mut highest,
                             midi as f32,
@@ -709,6 +794,27 @@ impl PitchHelperApp {
                 });
             self.graph_max_limit = highest;
         });
+        if self.graph_min_limit != previous_graph_min || self.graph_max_limit != previous_graph_max
+        {
+            self.center_on_root = true;
+        }
+        let clamped_root = self.root_note.clamp(
+            self.graph_min_limit.ceil() as i32,
+            self.graph_max_limit.floor() as i32,
+        );
+        if clamped_root != self.root_note {
+            self.root_note = clamped_root;
+            self.center_on_root = true;
+            if self.warmup.is_some() {
+                self.stop_warmup();
+            }
+            if self.echo.is_some() {
+                self.stop_echo();
+            }
+            if self.reference_enabled {
+                self.start_reference_tone();
+            }
+        }
         ui.add_space(8.0);
         let mut refresh_inputs = false;
         let panel_width = ui.available_width();
@@ -1056,21 +1162,22 @@ impl PitchHelperApp {
     }
 
     fn draw_practice_controls(&mut self, ui: &mut egui::Ui) {
-        let mut key_changed = false;
+        let mut root_changed = false;
+        let mut recenter_root = false;
         let mut scale_changed = false;
-        let mut root_octave_changed = false;
-        let mut warmup_pattern_changed = false;
+        let mut exercise_pattern_changed = false;
         let mut reference_changed = false;
         let mut reference_toggled = false;
         let mut metronome_changed = false;
         let mut stop_practice = false;
         let mut start_warmup = false;
         let mut start_echo = false;
+        let mut next_echo = false;
         ui.add_space(8.0);
         let panel_width = ui.available_width();
         ui.group(|ui| {
             ui.set_width((panel_width - 16.0).max(0.0));
-            ui.columns(2, |columns| {
+            ui.columns(3, |columns| {
                 let column_width = columns[0].available_width();
                 columns[0].group(|ui| {
                     ui.set_width((column_width - 16.0).max(0.0));
@@ -1082,12 +1189,14 @@ impl PitchHelperApp {
                         {
                             metronome_changed = true;
                         }
-                        ui.add_enabled(
-                            self.metronome_enabled,
-                            egui::Slider::new(&mut self.metronome_volume, 0.0..=1.0)
-                                .show_value(false)
-                                .text("Volume"),
-                        );
+                        ui.add_enabled_ui(self.metronome_enabled, |ui| {
+                            ui.add_sized(
+                                [52.0, 20.0],
+                                egui::Slider::new(&mut self.metronome_volume, 0.0..=1.0)
+                                    .show_value(false),
+                            )
+                            .on_hover_text("Metronome volume");
+                        });
                         ui.label(format!("{:.0}%", self.metronome_volume * 100.0));
                     });
                 });
@@ -1096,40 +1205,27 @@ impl PitchHelperApp {
                     ui.set_width((column_width - 16.0).max(0.0));
                     ui.horizontal_wrapped(|ui| {
                         ui.label(RichText::new("KEY & SCALE").small().strong());
+                        let previous_root = self.root_note;
                         egui::ComboBox::from_id_salt("song_key")
-                            .selected_text(KEY_NAMES[self.key_root])
-                            .width(54.0)
+                            .selected_text(midi_to_note(self.root_note as f32).1)
+                            .width(56.0)
                             .show_ui(ui, |ui| {
-                                for (index, key) in KEY_NAMES.iter().enumerate() {
-                                    key_changed |= ui
-                                        .selectable_value(&mut self.key_root, index, *key)
-                                        .changed();
+                                for midi in
+                                    root_note_choices(self.graph_min_limit, self.graph_max_limit)
+                                {
+                                    let response = ui.selectable_value(
+                                        &mut self.root_note,
+                                        midi,
+                                        midi_to_note(midi as f32).1,
+                                    );
+                                    root_changed |= response.changed();
+                                    recenter_root |= response.clicked();
                                 }
                             });
-                        let previous_octave = self.root_octave;
-                        egui::ComboBox::from_id_salt("key_root_octave")
-                            .selected_text(format!(
-                                "{}{}",
-                                KEY_NAMES[self.key_root], self.root_octave
-                            ))
-                            .width(58.0)
-                            .show_ui(ui, |ui| {
-                                for octave in 1..=6 {
-                                    ui.selectable_value(
-                                        &mut self.root_octave,
-                                        octave,
-                                        format!("{}{octave}", KEY_NAMES[self.key_root]),
-                                    );
-                                }
-                            })
-                            .response
-                            .on_hover_text(
-                                "Shared root octave for reference tones and practice routines.",
-                            );
-                        root_octave_changed = previous_octave != self.root_octave;
+                        root_changed |= previous_root != self.root_note;
                         egui::ComboBox::from_id_salt("song_scale")
                             .selected_text(self.scale.label())
-                            .width(124.0)
+                            .width(112.0)
                             .show_ui(ui, |ui| {
                                 for scale in [
                                     Scale::Major,
@@ -1144,12 +1240,8 @@ impl PitchHelperApp {
                             });
                     });
                 });
-            });
-
-            ui.add_space(6.0);
-            ui.columns(3, |columns| {
-                let column_width = columns[0].available_width();
-                columns[0].group(|ui| {
+                let column_width = columns[2].available_width();
+                columns[2].group(|ui| {
                     ui.set_width((column_width - 16.0).max(0.0));
                     ui.horizontal_wrapped(|ui| {
                         ui.label(RichText::new("REFERENCE TONE").small().strong());
@@ -1161,7 +1253,7 @@ impl PitchHelperApp {
                                 ReferenceKind::Root => "Root",
                                 ReferenceKind::Fifth => "Fifth",
                             })
-                            .width(100.0)
+                            .width(84.0)
                             .show_ui(ui, |ui| {
                                 for (kind, label) in [
                                     (ReferenceKind::Root, "Root"),
@@ -1174,25 +1266,19 @@ impl PitchHelperApp {
                             });
                     });
                 });
-                let column_width = columns[1].available_width();
-                columns[1].group(|ui| {
+            });
+
+            ui.add_space(6.0);
+            ui.columns(3, |columns| {
+                let column_width = columns[0].available_width();
+                columns[0].group(|ui| {
                     ui.set_width((column_width - 16.0).max(0.0));
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new("WARM-UP").small().strong())
-                            .on_hover_text(
-                                "Warm-ups start from the shared Key & Scale root and octave.",
-                            );
-                        ui.label(
-                            RichText::new(format!(
-                                "{}{}",
-                                KEY_NAMES[self.key_root], self.root_octave
-                            ))
-                            .size(11.0)
-                            .color(Color32::from_rgb(125, 145, 161)),
-                        );
-                        egui::ComboBox::from_id_salt("warmup_pattern")
-                            .selected_text(self.warmup_pattern.label())
-                            .width(112.0)
+                        ui.label(RichText::new("EXERCISE PATTERN").small().strong())
+                            .on_hover_text("Shared by Warm-Up and Pitch Echo.");
+                        egui::ComboBox::from_id_salt("exercise_pattern")
+                            .selected_text(self.exercise_pattern.label())
+                            .width(108.0)
                             .show_ui(ui, |ui| {
                                 for pattern in [
                                     WarmupPattern::FiveTone,
@@ -1200,15 +1286,28 @@ impl PitchHelperApp {
                                     WarmupPattern::Arpeggio,
                                     WarmupPattern::Siren,
                                 ] {
-                                    warmup_pattern_changed |= ui
+                                    exercise_pattern_changed |= ui
                                         .selectable_value(
-                                            &mut self.warmup_pattern,
+                                            &mut self.exercise_pattern,
                                             pattern,
                                             pattern.label(),
                                         )
                                         .changed();
                                 }
                             });
+                    });
+                });
+                let column_width = columns[1].available_width();
+                columns[1].group(|ui| {
+                    ui.set_width((column_width - 16.0).max(0.0));
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("WARM-UP").small().strong())
+                            .on_hover_text("Warm-ups start from the shared Key & Scale note.");
+                        ui.label(
+                            RichText::new(midi_to_note(self.root_note as f32).1)
+                                .size(11.0)
+                                .color(Color32::from_rgb(125, 145, 161)),
+                        );
                         if self.warmup.is_some() {
                             if ui.button("Stop Warm-Up").clicked() {
                                 stop_practice = true;
@@ -1223,48 +1322,58 @@ impl PitchHelperApp {
                     ui.set_width((column_width - 16.0).max(0.0));
                     ui.horizontal_wrapped(|ui| {
                         ui.label(RichText::new("PITCH ECHO").small().strong());
-                        if self.echo.is_some() {
-                            if ui.button("Stop Echo").clicked() {
-                                stop_practice = true;
-                            }
-                        } else if ui.button("Play Phrase").clicked() {
-                            start_echo = true;
-                        }
                         if let Some(session) = &self.echo {
-                            let status = match session.phase {
-                                EchoPhase::Countdown => echo_countdown_value(
-                                    Instant::now().duration_since(session.started_at),
-                                )
-                                .map(|number| format!("Get ready: {number}"))
-                                .unwrap_or_else(|| "Starting phrase…".to_owned()),
-                                EchoPhase::Prompting => "Listen, then sing it back".to_owned(),
-                                EchoPhase::Responding => "Sing the 3-note phrase".to_owned(),
-                            };
-                            ui.label(status);
-                        } else if let Some(score) = self.echo_score {
-                            ui.label(format!("Match: {score:.0}%"));
+                            if session.phase == EchoPhase::Score {
+                                if ui.button("Next Sequence").clicked() {
+                                    next_echo = true;
+                                }
+                                if ui.button("Stop Echo").clicked() {
+                                    stop_practice = true;
+                                }
+                                if let Some(score) = self.echo_score {
+                                    ui.label(format!("Match: {score:.0}%"));
+                                }
+                            } else {
+                                if ui.button("Stop Echo").clicked() {
+                                    stop_practice = true;
+                                }
+                                let status = match session.phase {
+                                    EchoPhase::Countdown => "Get ready to listen",
+                                    EchoPhase::Prompting => "Listen to the phrase",
+                                    EchoPhase::Pause => "Get ready to sing",
+                                    EchoPhase::Responding => "Sing the phrase back",
+                                    EchoPhase::Score => "Sequence scored",
+                                };
+                                ui.label(status);
+                            }
+                        } else if ui.button("Start Echo").clicked() {
+                            start_echo = true;
                         }
                     });
                 });
             });
         });
 
-        let root_changed = key_changed || root_octave_changed;
-        let warmup_config_changed = root_changed || scale_changed || warmup_pattern_changed;
-        if warmup_config_changed && self.warmup.is_some() {
+        if root_changed || recenter_root {
+            self.center_on_root = true;
+        }
+        let practice_config_changed = root_changed || scale_changed || exercise_pattern_changed;
+        if practice_config_changed && self.warmup.is_some() {
             self.stop_warmup();
         }
-        if (root_changed || scale_changed) && self.echo.is_some() {
+        if practice_config_changed && self.echo.is_some() {
             self.stop_echo();
         }
         if root_changed && self.reference_enabled {
             self.start_reference_tone();
         }
-        if metronome_changed
-            && let Err(message) = self.metronome.set_enabled(self.metronome_enabled)
-        {
-            self.metronome_enabled = false;
-            self.error = Some(message);
+        if metronome_changed {
+            if let Err(message) = self.metronome.set_enabled(self.metronome_enabled) {
+                self.metronome_enabled = false;
+                self.error = Some(message);
+            } else if self.metronome_enabled {
+                self.metronome.set_position(self.beat_position);
+            }
         }
         if reference_toggled || reference_changed {
             if self.reference_enabled {
@@ -1283,6 +1392,8 @@ impl PitchHelperApp {
             self.start_warmup();
         } else if start_echo {
             self.start_echo();
+        } else if next_echo {
+            self.start_next_echo_sequence();
         }
     }
 
@@ -1769,6 +1880,7 @@ impl PitchHelperApp {
     fn draw_menu_bar(&mut self, ctx: &egui::Context) -> bool {
         let mut open_audio = false;
         egui::TopBottomPanel::top("application_menu").show(ctx, |ui| {
+            let menu_bar_rect = ui.max_rect();
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui
@@ -1776,29 +1888,39 @@ impl PitchHelperApp {
                         .clicked()
                     {
                         open_audio = true;
+                        ui.close_menu();
                     }
                     ui.separator();
                     if ui.button("Quit").clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        ui.close_menu();
                     }
+                    close_menu_if_pointer_left(ui, menu_bar_rect);
                 });
                 ui.menu_button("Settings", |ui| {
-                    ui.menu_button("Appearance", |ui| {
-                        ui.selectable_value(&mut self.theme, ThemeChoice::System, "System");
-                        ui.selectable_value(&mut self.theme, ThemeChoice::Light, "Light");
-                        ui.selectable_value(&mut self.theme, ThemeChoice::Dark, "Dark");
-                    });
+                    ui.label("Appearance");
+                    ui.selectable_value(&mut self.theme, ThemeChoice::System, "System");
+                    ui.selectable_value(&mut self.theme, ThemeChoice::Light, "Light");
+                    ui.selectable_value(&mut self.theme, ThemeChoice::Dark, "Dark");
                     ui.separator();
                     ui.label("Key / Scale Highlight Opacity");
                     ui.add(
                         egui::Slider::new(&mut self.highlight_opacity, 0.0..=0.5).show_value(false),
                     );
                     ui.label(format!("{:.0}%", self.highlight_opacity * 100.0));
+                    ui.separator();
+                    if ui.button("Clear Range & Tessitura History…").clicked() {
+                        self.clear_range_confirmation = true;
+                        ui.close_menu();
+                    }
+                    close_menu_if_pointer_left(ui, menu_bar_rect);
                 });
                 ui.menu_button("Help", |ui| {
                     if ui.button("About PitchHelper…").clicked() {
                         self.about_open = true;
+                        ui.close_menu();
                     }
+                    close_menu_if_pointer_left(ui, menu_bar_rect);
                 });
             });
         });
@@ -1844,6 +1966,34 @@ impl PitchHelperApp {
 
                 ui.weak(COPYRIGHT);
             });
+    }
+
+    fn draw_range_clear_confirmation(&mut self, ctx: &egui::Context) {
+        let mut confirmed = false;
+        let mut cancelled = false;
+        egui::Window::new("Clear Range & Tessitura History?")
+            .collapsible(false)
+            .resizable(false)
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .open(&mut self.clear_range_confirmation)
+            .default_width(360.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    "This permanently removes the saved global range and tessitura history, and clears the current session values.",
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    confirmed = ui.button("Clear History").clicked();
+                    cancelled = ui.button("Cancel").clicked();
+                });
+            });
+        if cancelled {
+            self.clear_range_confirmation = false;
+        }
+        if confirmed {
+            self.clear_range_history();
+        }
     }
 
     fn draw_pitch_readout(&self, ui: &mut egui::Ui) {
@@ -1921,24 +2071,59 @@ impl PitchHelperApp {
                     None => "Hold a note".to_owned(),
                 };
                 ui.label(RichText::new(label).size(15.0).strong());
-                let range_text = match (self.range_tracker.low, self.range_tracker.high) {
-                    (Some(low), Some(high)) => {
-                        let (tessitura_low, tessitura_high) =
-                            self.range_tracker.tessitura().unwrap_or((low, high));
-                        format!(
-                            "Range {}–{} · Tessitura {}–{}",
-                            midi_to_note(low as f32).1,
-                            midi_to_note(high as f32).1,
-                            midi_to_note(tessitura_low as f32).1,
-                            midi_to_note(tessitura_high as f32).1
-                        )
-                    }
-                    _ => "Range tracker: sing steady notes".to_owned(),
+                ui.label(
+                    RichText::new("RANGE & TESSITURA")
+                        .size(10.0)
+                        .strong()
+                        .color(Color32::from_rgb(125, 145, 161)),
+                );
+                let session_text = match (
+                    self.session_range_tracker.low,
+                    self.session_range_tracker.high,
+                ) {
+                    (Some(low), Some(high)) => format!(
+                        "{}–{}",
+                        midi_to_note(low as f32).1,
+                        midi_to_note(high as f32).1
+                    ),
+                    _ => "Sing a note to start tracking".to_owned(),
                 };
                 ui.label(
-                    RichText::new(range_text)
+                    RichText::new(format!("Session: {session_text}"))
                         .size(10.0)
                         .color(Color32::from_rgb(125, 145, 161)),
+                );
+                let global_values = match (
+                    self.range_tracker.low,
+                    self.range_tracker.high,
+                    self.range_tracker.tessitura(),
+                ) {
+                    (Some(low), Some(high), Some((tessitura_low, tessitura_high))) => format!(
+                        "Range {}–{} · Tessitura {}–{} (blue band)",
+                        midi_to_note(low as f32).1,
+                        midi_to_note(high as f32).1,
+                        midi_to_note(tessitura_low as f32).1,
+                        midi_to_note(tessitura_high as f32).1
+                    ),
+                    (Some(low), Some(high), None) => format!(
+                        "Range {}–{} · Tessitura not available yet",
+                        midi_to_note(low as f32).1,
+                        midi_to_note(high as f32).1
+                    ),
+                    (None, None, Some((tessitura_low, tessitura_high))) => format!(
+                        "Range not available · Tessitura {}–{} (blue band)",
+                        midi_to_note(tessitura_low as f32).1,
+                        midi_to_note(tessitura_high as f32).1
+                    ),
+                    _ => "No saved range or tessitura".to_owned(),
+                };
+                ui.label(
+                    RichText::new(format!("Global: {global_values}"))
+                        .size(10.0)
+                        .color(Color32::from_rgb(125, 145, 161)),
+                )
+                .on_hover_text(
+                    "The blue band shows an across-session tessitura estimate: the central 80% of steady pitch samples. It is recalculated from all saved samples, so it can move lower or higher; sustained steady notes in a new range may be needed to shift it. It indicates stability, not subjective comfort. Global history is stored in your user data folder.",
                 );
             });
         });
@@ -1984,13 +2169,28 @@ impl PitchHelperApp {
                 plot.bottom() - (visible_high - low_midi) / (high_midi - low_midi) * plot.height();
             let bottom =
                 plot.bottom() - (visible_low - low_midi) / (high_midi - low_midi) * plot.height();
+            let tessitura_rect = egui::Rect::from_min_max(
+                egui::pos2(plot.left(), top),
+                egui::pos2(plot.right(), bottom),
+            );
             painter.rect_filled(
-                egui::Rect::from_min_max(
-                    egui::pos2(plot.left(), top),
-                    egui::pos2(plot.right(), bottom),
-                ),
+                tessitura_rect,
                 0.0,
-                Color32::from_rgba_unmultiplied(120, 115, 195, if dark { 6 } else { 7 }),
+                Color32::from_rgba_unmultiplied(80, 156, 255, if dark { 28 } else { 38 }),
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(tessitura_rect.left(), tessitura_rect.top()),
+                    egui::pos2(tessitura_rect.right(), tessitura_rect.top()),
+                ],
+                Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(80, 156, 255, 150)),
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(tessitura_rect.left(), tessitura_rect.bottom()),
+                    egui::pos2(tessitura_rect.right(), tessitura_rect.bottom()),
+                ],
+                Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(80, 156, 255, 150)),
             );
         }
         let row_height = plot.height() / (high_midi - low_midi);
@@ -1998,7 +2198,7 @@ impl PitchHelperApp {
             if !(low_midi..=high_midi).contains(&(midi as f32)) {
                 continue;
             }
-            let interval = (midi - self.key_root as i32).rem_euclid(12);
+            let interval = (midi - self.root_note.rem_euclid(12)).rem_euclid(12);
             if self.scale.intervals().contains(&interval) {
                 let top = plot.bottom() - (midi as f32 + 0.5 - low_midi) * row_height;
                 let bottom = plot.bottom() - (midi as f32 - 0.5 - low_midi) * row_height;
@@ -2025,7 +2225,7 @@ impl PitchHelperApp {
             egui::Align2::RIGHT_CENTER,
             format!(
                 "{} {} · brighter rows are chord tones",
-                KEY_NAMES[self.key_root],
+                midi_to_note(self.root_note as f32).1,
                 self.scale.label()
             ),
             FontId::proportional(9.0),
@@ -2100,12 +2300,13 @@ impl PitchHelperApp {
 
         let now = Instant::now();
         if let Some(session) = &self.warmup {
-            draw_target_notes(
+            draw_practice_target_notes(
                 &painter,
                 plot,
                 low_midi,
                 high_midi,
                 &session.notes,
+                session.note_duration,
                 Color32::from_rgb(248, 191, 76),
             );
         } else if let Some(session) = &self.echo {
@@ -2141,7 +2342,7 @@ impl PitchHelperApp {
         }
 
         if let Some(session) = &self.echo
-            && session.phase == EchoPhase::Countdown
+            && matches!(session.phase, EchoPhase::Countdown | EchoPhase::Pause)
             && let Some(number) = echo_countdown_value(now.duration_since(session.started_at))
         {
             painter.circle_filled(
@@ -2158,25 +2359,20 @@ impl PitchHelperApp {
             );
         }
 
-        let phase = if self.echo_score.is_some() {
-            1.0
-        } else if let Some(session) = &self.echo {
+        let phase = if let Some(session) = &self.echo {
             match session.phase {
-                EchoPhase::Countdown | EchoPhase::Prompting => 0.0,
-                EchoPhase::Responding => practice_phase(
-                    now,
-                    session.started_at,
-                    session.note_duration,
-                    session.notes.len(),
-                ),
+                EchoPhase::Countdown | EchoPhase::Pause => 0.0,
+                EchoPhase::Prompting | EchoPhase::Responding | EchoPhase::Score => {
+                    echo_sequence_phase(
+                        now,
+                        session.started_at,
+                        session.note_duration,
+                        session.notes.len(),
+                    )
+                }
             }
         } else if let Some(session) = &self.warmup {
-            practice_phase(
-                now,
-                session.started_at,
-                session.note_duration,
-                session.notes.len(),
-            )
+            practice_phase(now, session.started_at, session.note_duration)
         } else {
             self.measure_phase
         };
@@ -2328,6 +2524,7 @@ impl eframe::App for PitchHelperApp {
         });
 
         self.draw_about(ctx);
+        self.draw_range_clear_confirmation(ctx);
         ctx.request_repaint_after(Duration::from_millis(33));
     }
 }
@@ -2342,6 +2539,16 @@ impl Drop for PitchHelperApp {
     }
 }
 
+fn close_menu_if_pointer_left(ui: &mut egui::Ui, menu_bar_rect: egui::Rect) {
+    let menu_rect = ui.min_rect().expand(10.0);
+    let pointer_inside_menu = ui
+        .input(|input| input.pointer.hover_pos())
+        .is_some_and(|position| menu_rect.contains(position) || menu_bar_rect.contains(position));
+    if !pointer_inside_menu {
+        ui.close_menu();
+    }
+}
+
 fn warmup_notes(pattern: WarmupPattern, tonic: i32) -> Vec<i32> {
     pattern
         .intervals()
@@ -2350,8 +2557,12 @@ fn warmup_notes(pattern: WarmupPattern, tonic: i32) -> Vec<i32> {
         .collect()
 }
 
-fn root_midi(key_root: usize, octave: i32) -> i32 {
-    (octave.clamp(1, 6) + 1) * 12 + key_root as i32
+fn exercise_note_duration(bpm: f32) -> Duration {
+    Duration::from_secs_f64(60.0 / bpm.clamp(40.0, 240.0) as f64)
+}
+
+fn root_note_choices(low: f32, high: f32) -> std::ops::RangeInclusive<i32> {
+    low.ceil() as i32..=high.floor() as i32
 }
 
 fn next_warmup_tonic(tonic: i32, direction: i32, low: i32, high: i32) -> (i32, i32) {
@@ -2365,7 +2576,15 @@ fn next_warmup_tonic(tonic: i32, direction: i32, low: i32, high: i32) -> (i32, i
     (tonic + direction, direction)
 }
 
-fn practice_phase(
+fn practice_phase(now: Instant, started_at: Instant, note_duration: Duration) -> f32 {
+    let total_seconds = note_duration.as_secs_f32() * VISIBLE_BARS * BAR_BEATS;
+    if total_seconds <= 0.0 {
+        return 0.0;
+    }
+    (now.duration_since(started_at).as_secs_f32() / total_seconds).clamp(0.0, 1.0)
+}
+
+fn echo_sequence_phase(
     now: Instant,
     started_at: Instant,
     note_duration: Duration,
@@ -2398,6 +2617,37 @@ fn draw_target_notes(
         }
         let left = plot.left() + index as f32 / notes.len() as f32 * plot.width();
         let right = plot.left() + (index + 1) as f32 / notes.len() as f32 * plot.width();
+        let y = plot.bottom() - (*note as f32 - low_midi) / (high_midi - low_midi) * plot.height();
+        painter.line_segment(
+            [egui::pos2(left, y), egui::pos2(right, y)],
+            Stroke::new(2.0_f32, color),
+        );
+    }
+}
+
+fn draw_practice_target_notes(
+    painter: &egui::Painter,
+    plot: egui::Rect,
+    low_midi: f32,
+    high_midi: f32,
+    notes: &[i32],
+    note_duration: Duration,
+    color: Color32,
+) {
+    let measure_duration = note_duration.as_secs_f32() * VISIBLE_BARS * BAR_BEATS;
+    if notes.is_empty() || measure_duration <= 0.0 {
+        return;
+    }
+    let note_width = plot.width() * note_duration.as_secs_f32() / measure_duration;
+    for (index, note) in notes.iter().enumerate() {
+        if !(*note as f32 >= low_midi && *note as f32 <= high_midi) {
+            continue;
+        }
+        let left = plot.left() + index as f32 * note_width;
+        if left >= plot.right() {
+            break;
+        }
+        let right = (left + note_width).min(plot.right());
         let y = plot.bottom() - (*note as f32 - low_midi) / (high_midi - low_midi) * plot.height();
         painter.line_segment(
             [egui::pos2(left, y), egui::pos2(right, y)],
@@ -2540,10 +2790,10 @@ fn zoom_label(zoom_scale: f32) -> String {
 mod tests {
     use super::{
         LoopHandle, WarmupPattern, advance_beat_position, advance_song_beat_position,
-        centered_graph_range, clamp_graph_center, echo_countdown_value, follow_graph_center,
-        format_track_time, graph_range_for_zoom, measure_phase, move_loop_handle,
-        next_warmup_tonic, practice_phase, root_midi, should_show_scrub_preview, warmup_notes,
-        zoom_label,
+        centered_graph_range, clamp_graph_center, echo_countdown_value, echo_sequence_phase,
+        exercise_note_duration, follow_graph_center, format_track_time, graph_range_for_zoom,
+        measure_phase, move_loop_handle, next_warmup_tonic, practice_phase, root_note_choices,
+        should_show_scrub_preview, warmup_notes, zoom_label,
     };
     use std::time::Duration;
 
@@ -2603,29 +2853,52 @@ mod tests {
     }
 
     #[test]
-    fn practice_progress_maps_to_the_full_graph_width() {
+    fn practice_progress_tracks_beats_across_the_four_bar_graph() {
         let started_at = std::time::Instant::now();
         let note_duration = Duration::from_millis(450);
-        assert_eq!(
-            practice_phase(started_at, started_at, note_duration, 3),
-            0.0
-        );
+        assert_eq!(practice_phase(started_at, started_at, note_duration), 0.0);
         assert!(
             (practice_phase(
                 started_at + Duration::from_millis(675),
                 started_at,
                 note_duration,
-                3
-            ) - 0.5)
+            ) - 0.09375)
                 .abs()
                 < 0.001
         );
         assert_eq!(
             practice_phase(
-                started_at + Duration::from_millis(2000),
+                started_at + Duration::from_millis(7200),
                 started_at,
                 note_duration,
-                3
+            ),
+            1.0
+        );
+    }
+
+    #[test]
+    fn echo_progress_spans_only_the_sequence_duration_and_holds_at_the_end() {
+        let started_at = std::time::Instant::now();
+        let note_duration = Duration::from_millis(500);
+        assert_eq!(
+            echo_sequence_phase(started_at, started_at, note_duration, 4),
+            0.0
+        );
+        assert_eq!(
+            echo_sequence_phase(
+                started_at + Duration::from_secs(1),
+                started_at,
+                note_duration,
+                4,
+            ),
+            0.5
+        );
+        assert_eq!(
+            echo_sequence_phase(
+                started_at + Duration::from_secs(3),
+                started_at,
+                note_duration,
+                4,
             ),
             1.0
         );
@@ -2637,6 +2910,13 @@ mod tests {
         assert_eq!(echo_countdown_value(Duration::from_millis(1_500)), Some(2));
         assert_eq!(echo_countdown_value(Duration::from_millis(2_500)), Some(1));
         assert_eq!(echo_countdown_value(Duration::from_secs(3)), None);
+    }
+
+    #[test]
+    fn exercise_note_duration_follows_selected_tempo() {
+        assert_eq!(exercise_note_duration(60.0), Duration::from_secs(1));
+        assert_eq!(exercise_note_duration(120.0), Duration::from_millis(500));
+        assert_eq!(exercise_note_duration(240.0), Duration::from_millis(250));
     }
 
     #[test]
@@ -2653,11 +2933,28 @@ mod tests {
     }
 
     #[test]
-    fn shared_root_octave_maps_key_to_expected_midi_note() {
-        assert_eq!(root_midi(0, 3), 48);
-        assert_eq!(root_midi(0, 4), 60);
-        assert_eq!(root_midi(2, 4), 62);
-        assert_eq!(root_midi(9, 3), 57);
+    fn key_root_choices_include_each_note_inside_graph_limits() {
+        let choices = root_note_choices(24.0, 96.0).collect::<Vec<_>>();
+        assert_eq!(choices.first(), Some(&24));
+        assert_eq!(choices.last(), Some(&96));
+        assert_eq!(choices.len(), 73);
+        assert_eq!(
+            root_note_choices(60.2, 63.8).collect::<Vec<_>>(),
+            vec![61, 62, 63]
+        );
+    }
+
+    #[test]
+    fn centering_on_the_selected_root_clamps_to_the_display_limits() {
+        // Zoom 1.0 spans MIDI 42..=78 (span 36), so a valid center is 42..=78.
+        // A normal root stays where it is asked.
+        assert_eq!(clamp_graph_center(24.0, 96.0, 36.0, 60.0), 60.0);
+        // The lowest selectable root (C1) is pushed up as far as the limits allow.
+        assert_eq!(clamp_graph_center(24.0, 96.0, 36.0, 24.0), 42.0);
+        // The highest selectable root (C7) is pushed down as far as the limits allow.
+        assert_eq!(clamp_graph_center(24.0, 96.0, 36.0, 96.0), 78.0);
+        // A tighter zoom (span 18) narrows the valid center range to 33..=87.
+        assert_eq!(clamp_graph_center(24.0, 96.0, 18.0, 24.0), 33.0);
     }
 
     #[test]

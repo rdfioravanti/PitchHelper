@@ -114,17 +114,16 @@ impl Default for RangeTracker {
 
 impl RangeTracker {
     pub fn record(&mut self, midi: f32, steady: bool) -> bool {
-        if !steady {
-            return false;
-        }
         let note = midi.round() as i32;
         if !(12..=120).contains(&note) {
             return false;
         }
         self.low = Some(self.low.map_or(note, |low| low.min(note)));
         self.high = Some(self.high.map_or(note, |high| high.max(note)));
-        self.stable_counts[(note - 12) as usize] =
-            self.stable_counts[(note - 12) as usize].saturating_add(1);
+        if steady {
+            self.stable_counts[(note - 12) as usize] =
+                self.stable_counts[(note - 12) as usize].saturating_add(1);
+        }
         true
     }
 
@@ -220,6 +219,16 @@ impl RangeTracker {
         }
         Ok(())
     }
+
+    pub fn clear_saved() -> std::io::Result<()> {
+        let path = range_file_path()
+            .ok_or_else(|| std::io::Error::other("Could not locate a user data directory."))?;
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 fn range_file_path() -> Option<PathBuf> {
@@ -247,14 +256,30 @@ mod tests {
     }
 
     #[test]
-    fn range_tracks_only_steady_singing_and_computes_tessitura() {
+    fn range_tracks_detected_notes_but_tessitura_uses_only_steady_notes() {
         let mut tracker = RangeTracker::default();
-        assert!(!tracker.record(48.0, false));
+        assert!(tracker.record(40.0, false));
+        assert_eq!((tracker.low, tracker.high), (Some(40), Some(40)));
+        assert_eq!(tracker.tessitura(), None);
         tracker.record(48.0, true);
         tracker.record(60.0, true);
         tracker.record(60.0, true);
         tracker.record(72.0, true);
-        assert_eq!((tracker.low, tracker.high), (Some(48), Some(72)));
+        assert_eq!((tracker.low, tracker.high), (Some(40), Some(72)));
+        assert_eq!(tracker.tessitura(), Some((48, 72)));
+    }
+
+    #[test]
+    fn tessitura_estimate_can_shift_lower_with_new_steady_samples() {
+        let mut tracker = RangeTracker::default();
+        for _ in 0..10 {
+            tracker.record(72.0, true);
+        }
+        assert_eq!(tracker.tessitura(), Some((72, 72)));
+
+        for _ in 0..20 {
+            tracker.record(48.0, true);
+        }
         assert_eq!(tracker.tessitura(), Some((48, 72)));
     }
 

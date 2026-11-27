@@ -1,10 +1,17 @@
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use rodio::buffer::SamplesBuffer;
 use rodio::source::SineWave;
 use rodio::{Decoder, OutputStream, Sink, Source};
+
+const PRACTICE_SAMPLE_RATE: u32 = 44_100;
+const NOTE_EDGE_FADE: Duration = Duration::from_millis(8);
+const STOP_FADE_DURATION: Duration = Duration::from_millis(24);
 
 pub struct SongPlayer {
     output: Option<OutputStream>,
@@ -123,6 +130,7 @@ impl SongPlayer {
 pub struct TonePlayer {
     output: Option<OutputStream>,
     sink: Option<Sink>,
+    stop_signal: Option<Arc<AtomicBool>>,
 }
 
 impl TonePlayer {
@@ -130,15 +138,16 @@ impl TonePlayer {
         Self {
             output: None,
             sink: None,
+            stop_signal: None,
         }
     }
 
     pub fn play_drone(&mut self, midi: i32, volume: f32) -> Result<(), String> {
         self.start_output(volume)?;
-        let Some(sink) = self.sink.as_ref() else {
-            return Err("Could not create practice audio player.".to_owned());
-        };
-        sink.append(SineWave::new(midi_frequency(midi)).repeat_infinite());
+        let source = SineWave::new(midi_frequency(midi)).repeat_infinite();
+        let (source, stop_signal) = FadeOut::new(source, STOP_FADE_DURATION);
+        self.append_source(source)?;
+        self.stop_signal = Some(stop_signal);
         Ok(())
     }
 
@@ -151,18 +160,25 @@ impl TonePlayer {
         if notes.is_empty() {
             return Err("The practice routine has no notes to play.".to_owned());
         }
-        self.start_output(volume)?;
-        let Some(sink) = self.sink.as_ref() else {
-            return Err("Could not create practice audio player.".to_owned());
-        };
-        for note in notes {
-            sink.append(SineWave::new(midi_frequency(*note)).take_duration(note_duration));
+        if note_duration.is_zero() {
+            return Err("Practice notes must have a positive duration.".to_owned());
         }
+        self.start_output(volume)?;
+        let samples = SamplesBuffer::new(
+            1,
+            PRACTICE_SAMPLE_RATE,
+            practice_samples(notes, note_duration, PRACTICE_SAMPLE_RATE),
+        );
+        let (source, stop_signal) = FadeOut::new(samples, STOP_FADE_DURATION);
+        self.append_source(source)?;
+        self.stop_signal = Some(stop_signal);
         Ok(())
     }
 
     pub fn stop(&mut self) {
-        self.clear_output();
+        if let Some(stop_signal) = &self.stop_signal {
+            stop_signal.store(true, Ordering::Relaxed);
+        }
     }
 
     pub fn is_playing(&self) -> bool {
@@ -170,26 +186,178 @@ impl TonePlayer {
     }
 
     fn start_output(&mut self, volume: f32) -> Result<(), String> {
-        self.clear_output();
+        if let Some(stop_signal) = &self.stop_signal {
+            stop_signal.store(true, Ordering::Relaxed);
+        }
+        let volume = volume.clamp(0.0, 1.0);
+        if let Some(sink) = &self.sink {
+            sink.set_volume(volume);
+            return Ok(());
+        }
         let (output, handle) = OutputStream::try_default()
             .map_err(|error| format!("Could not open audio output: {error}"))?;
         let sink = Sink::try_new(&handle)
             .map_err(|error| format!("Could not create practice audio player: {error}"))?;
-        sink.set_volume(volume.clamp(0.0, 1.0));
+        sink.set_volume(volume);
         sink.play();
         self.output = Some(output);
         self.sink = Some(sink);
         Ok(())
     }
 
-    fn clear_output(&mut self) {
-        if let Some(sink) = self.sink.take() {
-            sink.stop();
+    fn append_source<S>(&self, source: S) -> Result<(), String>
+    where
+        S: Source<Item = f32> + Send + 'static,
+    {
+        let Some(sink) = &self.sink else {
+            return Err("Could not create practice audio player.".to_owned());
+        };
+        sink.append(source);
+        Ok(())
+    }
+}
+
+struct FadeOut<S> {
+    source: S,
+    stop_signal: Arc<AtomicBool>,
+    fade_frames: usize,
+    fade_remaining: Option<usize>,
+}
+
+impl<S> FadeOut<S>
+where
+    S: Source<Item = f32>,
+{
+    fn new(source: S, duration: Duration) -> (Self, Arc<AtomicBool>) {
+        let stop_signal = Arc::new(AtomicBool::new(false));
+        let fade_frames = (duration.as_secs_f64() * source.sample_rate() as f64).round() as usize;
+        (
+            Self {
+                source,
+                stop_signal: Arc::clone(&stop_signal),
+                fade_frames: fade_frames.max(1),
+                fade_remaining: None,
+            },
+            stop_signal,
+        )
+    }
+}
+
+impl<S> Iterator for FadeOut<S>
+where
+    S: Source<Item = f32>,
+{
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.fade_remaining == Some(0) {
+            return None;
         }
-        self.output = None;
+        let sample = self.source.next()?;
+        if self.stop_signal.load(Ordering::Relaxed) {
+            let remaining = *self.fade_remaining.get_or_insert(self.fade_frames);
+            let gain = (remaining.saturating_sub(1) as f32
+                / self.fade_frames.saturating_sub(1).max(1) as f32)
+                .clamp(0.0, 1.0);
+            self.fade_remaining = Some(remaining - 1);
+            Some(sample * gain)
+        } else {
+            Some(sample)
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, None)
+    }
+}
+
+impl<S> Source for FadeOut<S>
+where
+    S: Source<Item = f32>,
+{
+    fn current_frame_len(&self) -> Option<usize> {
+        self.source.current_frame_len()
+    }
+
+    fn channels(&self) -> u16 {
+        self.source.channels()
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.source.sample_rate()
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        self.source.total_duration()
     }
 }
 
 fn midi_frequency(midi: i32) -> f32 {
     440.0 * 2.0_f32.powf((midi as f32 - 69.0) / 12.0)
+}
+
+fn practice_samples(notes: &[i32], note_duration: Duration, sample_rate: u32) -> Vec<f32> {
+    let frames_per_note = (note_duration.as_secs_f64() * sample_rate as f64).round() as usize;
+    let fade_frames = ((NOTE_EDGE_FADE.as_secs_f64() * sample_rate as f64).round() as usize)
+        .min(frames_per_note / 2);
+    let mut samples = Vec::with_capacity(frames_per_note.saturating_mul(notes.len()));
+
+    for note in notes {
+        let frequency = midi_frequency(*note);
+        for frame in 0..frames_per_note {
+            let attack = if frame < fade_frames {
+                0.5 - 0.5 * (std::f32::consts::PI * frame as f32 / fade_frames as f32).cos()
+            } else {
+                1.0
+            };
+            let frames_to_end = frames_per_note - 1 - frame;
+            let release = if frames_to_end < fade_frames {
+                0.5 - 0.5 * (std::f32::consts::PI * frames_to_end as f32 / fade_frames as f32).cos()
+            } else {
+                1.0
+            };
+            let phase = std::f32::consts::TAU * frequency * frame as f32 / sample_rate as f32;
+            samples.push(phase.sin() * attack.min(release));
+        }
+    }
+
+    samples
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FadeOut, PRACTICE_SAMPLE_RATE, practice_samples};
+    use rodio::buffer::SamplesBuffer;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    #[test]
+    fn practice_notes_fade_to_silence_at_each_note_boundary() {
+        let note_duration = Duration::from_millis(450);
+        let frames_per_note =
+            (note_duration.as_secs_f64() * PRACTICE_SAMPLE_RATE as f64).round() as usize;
+        let samples = practice_samples(&[60, 67], note_duration, PRACTICE_SAMPLE_RATE);
+
+        assert_eq!(samples.len(), frames_per_note * 2);
+        assert!(samples[0].abs() < 0.001);
+        assert!(samples[samples.len() - 1].abs() < 0.001);
+        assert!(samples[frames_per_note - 1].abs() < 0.001);
+        assert!(samples[frames_per_note].abs() < 0.001);
+        assert!(samples[frames_per_note - 2].abs() < 0.01);
+        assert!(samples[frames_per_note + 1].abs() < 0.01);
+        assert!(samples.iter().any(|sample| sample.abs() > 0.5));
+    }
+
+    #[test]
+    fn stopping_practice_audio_fades_to_silence() {
+        let source = SamplesBuffer::new(1, 1_000, vec![0.5; 100]);
+        let (source, stop_signal) = FadeOut::new(source, Duration::from_millis(10));
+        stop_signal.store(true, Ordering::Relaxed);
+
+        let faded = source.collect::<Vec<_>>();
+        assert_eq!(faded.len(), 10);
+        assert_eq!(faded.first(), Some(&0.5));
+        assert_eq!(faded.last(), Some(&0.0));
+        assert!(faded.windows(2).all(|pair| pair[0] >= pair[1]));
+    }
 }
