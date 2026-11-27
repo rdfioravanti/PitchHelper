@@ -1156,10 +1156,10 @@ mod tests {
     use super::{
         DEFAULT_RANGE_SENSITIVITY, LoopHandle, WarmupPattern, advance_beat_position,
         advance_song_beat_position, centered_graph_range, clamp_graph_center, countdown_value,
-        exercise_note_duration, follow_graph_center, format_track_time,
-        graph_high_note_choices, graph_low_note_choices, graph_range_for_zoom, measure_phase,
-        move_loop_handle, next_warmup_tonic, practice_phase, range_sample_is_eligible,
-        root_note_choices, should_show_scrub_preview, warmup_notes, zoom_label,
+        exercise_note_duration, follow_graph_center, format_track_time, graph_high_note_choices,
+        graph_low_note_choices, graph_range_for_zoom, measure_phase, move_loop_handle,
+        next_warmup_tonic, practice_phase, range_sample_is_eligible, root_note_choices,
+        should_show_scrub_preview, warmup_notes, zoom_label,
     };
     use std::time::Duration;
 
@@ -1295,8 +1295,7 @@ mod tests {
                 started_at + Duration::from_secs(1),
                 started_at,
                 note_duration
-            )
-            - 0.125)
+            ) - 0.125)
                 .abs()
                 < 0.001
         );
@@ -1305,8 +1304,7 @@ mod tests {
                 started_at + Duration::from_secs(3),
                 started_at,
                 note_duration
-            )
-            - 0.375)
+            ) - 0.375)
                 .abs()
                 < 0.001
         );
