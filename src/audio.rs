@@ -544,23 +544,29 @@ where
     device.build_input_stream(
         config,
         move |data: &[T], _| {
-            let mono: Vec<f32> = data
-                .chunks(channels)
-                .map(|frame| {
-                    frame.iter().map(|sample| convert(*sample)).sum::<f32>() / channels as f32
-                })
-                .collect();
-            if let Ok(mut samples) = buffer.lock() {
-                samples.extend(mono.iter().copied());
+            let mut input_samples = buffer.lock().ok();
+            let mut monitor_samples = if monitor_enabled.load(Ordering::Acquire) {
+                monitor_buffer.lock().ok()
+            } else {
+                None
+            };
+            for frame in data.chunks(channels) {
+                let mono =
+                    frame.iter().map(|sample| convert(*sample)).sum::<f32>() / channels as f32;
+                if let Some(samples) = input_samples.as_mut() {
+                    samples.push_back(mono);
+                }
+                if let Some(samples) = monitor_samples.as_mut() {
+                    samples.push_back(mono);
+                }
+            }
+            if let Some(mut samples) = input_samples {
                 let overflow = samples.len().saturating_sub(BUFFER_CAPACITY);
                 if overflow > 0 {
                     samples.drain(..overflow);
                 }
             }
-            if monitor_enabled.load(Ordering::Acquire)
-                && let Ok(mut samples) = monitor_buffer.lock()
-            {
-                samples.extend(mono.iter().copied());
+            if let Some(mut samples) = monitor_samples {
                 let overflow = samples.len().saturating_sub(MONITOR_BUFFER_CAPACITY);
                 if overflow > 0 {
                     samples.drain(..overflow);

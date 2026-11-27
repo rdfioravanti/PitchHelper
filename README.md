@@ -13,7 +13,7 @@ It is written in Rust with no web runtime, and builds to a single native binary.
 | **Author**   | Richard Fioravanti                          |
 | **Version**  | 0.1.0                                       |
 | **Language** | Rust (edition 2024)                         |
-| **Platforms**| Windows · Linux                             |
+| **Platforms**| Windows · Linux · macOS                    |
 
 <!-- TODO: drop a screenshot here, e.g.  ![PitchHelper](docs/screenshot.png) -->
 
@@ -104,8 +104,10 @@ notes:
 
 - **Windows** — microphone input uses the system audio stack (WASAPI).
 - **Linux** — microphone input needs the ALSA development package, e.g.
-  `libasound2-dev` on Debian-based distributions. The ALSA runtime and a supported
-  display server must also be available.
+  `libasound2-dev` on Debian-based distributions. ALSA and the system libraries for
+  X11 or Wayland must also be available at runtime.
+- **macOS** — microphone input uses CoreAudio. Intel and Apple Silicon builds are
+  produced separately.
 
 ## Using the app
 
@@ -153,8 +155,9 @@ both. Seeking outside the visible four-measure cycle clears the pitch trace.
 
 Use **Zoom**, **LOW**, and **HIGH** beside the tempo control to shape the graph.
 
-- **LOW / HIGH** set the graph's boundaries. The default **1×** view zooms into those
-  bounds; **0.5×** shows the full range.
+- **LOW / HIGH** set the graph's boundaries without changing its zoom level. Zoom uses
+  a fixed semitone span: **1×** shows 36 semitones, **0.5×** shows up to 72, and **2×**
+  shows 18. Narrow bounds can restrict the visible span.
 - In free singing, the graph follows your live pitch smoothly as it nears the edge,
   without moving beyond LOW/HIGH.
 - During warm-ups and pitch echo it centers on the exercise's target notes; the
@@ -230,7 +233,7 @@ separate submenu for adjusting the key/scale highlight strength.
 | Reference tone                 | Root or fifth               | Shown as a yellow target line.                           |
 | Pitch detection range          | 25 – 2,500 Hz               | Autocorrelation over the mic buffer.                     |
 | Graph bounds                   | C1–C7                       | Adjustable from C0 to C9.                                |
-| Graph zoom                     | 1× (LOW/HIGH bounds)        | 0.5× shows the full range.                               |
+| Graph zoom                     | 1× (36 semitones)           | LOW/HIGH constrain bounds, not zoom.                     |
 | Metronome                      | Off                         | Enable with the Metronome controls.                      |
 | Metronome volume               | 35%                         | Adjustable independently of track volume.               |
 | Pitch Echo sequence            | Warm-Up pattern             | Score is shown until you advance to the next sequence.   |
@@ -275,10 +278,18 @@ Build a native release binary on the target platform:
 cargo build --release
 ```
 
-Build separately for Windows and Linux. On Linux, the system ALSA development
-library is required to build microphone input support (for example,
-`libasound2-dev` on Debian-based distributions). The resulting binary is in
-`target/release/`.
+Build separately for Windows, Linux, and macOS. On Linux, install the ALSA and
+desktop development libraries before building; on Debian-based distributions:
+
+```sh
+sudo apt-get install pkg-config libasound2-dev libx11-dev libxkbcommon-dev \
+  libwayland-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
+  libxkbcommon-x11-dev libgl1-mesa-dev
+```
+
+The resulting binary is in `target/release/`. GitHub Actions builds and tests the
+supported platforms; pushing a `v*` tag creates a GitHub release with packaged
+Windows x86-64, Linux x86-64, macOS Intel, and macOS Apple Silicon binaries.
 
 ## Running the tests
 

@@ -1,6 +1,10 @@
+use std::collections::VecDeque;
 use std::fs;
+use std::io::Read;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+const MAX_RANGE_HISTORY_BYTES: u64 = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scale {
@@ -73,7 +77,7 @@ pub struct PitchMetrics {
     pub sample_span: Duration,
 }
 
-pub fn pitch_metrics(samples: &[(Instant, f32)], now: Instant) -> Option<PitchMetrics> {
+pub fn pitch_metrics(samples: &VecDeque<(Instant, f32)>, now: Instant) -> Option<PitchMetrics> {
     let cutoff = now.checked_sub(Duration::from_millis(900))?;
     let pitches: Vec<f32> = samples
         .iter()
@@ -185,17 +189,24 @@ impl RangeTracker {
         let path = range_file_path().ok_or_else(|| {
             "Could not locate a user data directory for range history.".to_owned()
         })?;
-        let contents = match fs::read_to_string(path) {
-            Ok(contents) => contents,
+        let file = match fs::File::open(path) {
+            Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(Self::default());
             }
             Err(error) => return Err(format!("Could not read vocal range history: {error}")),
         };
+        let contents = read_limited_range_history(file)?;
+        Self::parse_history(&contents)
+    }
+
+    fn parse_history(contents: &str) -> Result<Self, String> {
         let mut lines = contents.lines();
         let Some((low, high)) = lines.next().and_then(|line| {
             let mut values = line.split(',');
-            Some((values.next()?.parse().ok()?, values.next()?.parse().ok()?))
+            let low = values.next()?.parse::<i32>().ok()?;
+            let high = values.next()?.parse::<i32>().ok()?;
+            values.next().is_none().then_some((low, high))
         }) else {
             return Err("Vocal range history has an invalid format.".to_owned());
         };
@@ -265,7 +276,19 @@ impl RangeTracker {
 fn range_file_path() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     let root = std::env::var_os("APPDATA").map(PathBuf::from);
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    let root = std::env::var_os("HOME").map(|home| {
+        PathBuf::from(home)
+            .join("Library")
+            .join("Application Support")
+    });
+    #[cfg(target_os = "linux")]
+    let root = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("share"))
+        });
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     let root = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| {
@@ -274,9 +297,25 @@ fn range_file_path() -> Option<PathBuf> {
     root.map(|root| root.join("PitchHelper").join("range.dat"))
 }
 
+fn read_limited_range_history(reader: impl Read) -> Result<String, String> {
+    let mut contents = Vec::new();
+    reader
+        .take(MAX_RANGE_HISTORY_BYTES + 1)
+        .read_to_end(&mut contents)
+        .map_err(|error| format!("Could not read vocal range history: {error}"))?;
+    if contents.len() as u64 > MAX_RANGE_HISTORY_BYTES {
+        return Err("Vocal range history exceeds the supported file size.".to_owned());
+    }
+    String::from_utf8(contents).map_err(|_| "Vocal range history is not valid UTF-8.".to_owned())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{RangeTracker, Scale, pitch_metrics};
+    use super::{
+        MAX_RANGE_HISTORY_BYTES, RangeTracker, Scale, pitch_metrics, read_limited_range_history,
+    };
+    use std::collections::VecDeque;
+    use std::io::Cursor;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -315,9 +354,26 @@ mod tests {
     }
 
     #[test]
+    fn range_history_parser_rejects_malformed_and_extra_fields() {
+        let counts = vec!["0"; 109].join(",");
+        let valid = format!("24,96\n{counts}\n");
+        let tracker = RangeTracker::parse_history(&valid).expect("history should parse");
+        assert_eq!((tracker.low, tracker.high), (Some(24), Some(96)));
+
+        assert!(RangeTracker::parse_history(&valid.replace("24,96", "24,96,60")).is_err());
+        assert!(RangeTracker::parse_history("24,96\n0,0\n").is_err());
+    }
+
+    #[test]
+    fn range_history_reader_rejects_oversized_files() {
+        let oversized = vec![b'0'; MAX_RANGE_HISTORY_BYTES as usize + 1];
+        assert!(read_limited_range_history(Cursor::new(oversized)).is_err());
+    }
+
+    #[test]
     fn pitch_metrics_distinguish_steady_tone_from_vibrato() {
         let now = Instant::now();
-        let steady_samples: Vec<_> = (0..30)
+        let steady_samples: VecDeque<_> = (0..30)
             .map(|index| {
                 let elapsed = Duration::from_millis(index * 30);
                 (now - Duration::from_millis(900) + elapsed, 60.0)
@@ -327,7 +383,7 @@ mod tests {
         assert!(steady.steady);
         assert!(steady.vibrato_hz.is_none());
 
-        let vibrato_samples: Vec<_> = (0..30)
+        let vibrato_samples: VecDeque<_> = (0..30)
             .map(|index| {
                 let elapsed = index as f32 * 0.03;
                 let time = now - Duration::from_millis(900) + Duration::from_secs_f32(elapsed);

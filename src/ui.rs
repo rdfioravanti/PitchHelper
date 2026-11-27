@@ -1,11 +1,12 @@
 use super::{
-    AudioLoadStatus, BAR_BEATS, CENTS_TOLERANCE, COPYRIGHT, EchoPhase, LOOP_HANDLE_HIT_RADIUS,
-    LoopHandle, PitchHelperApp, ReferenceKind, Scale, ThemeChoice, VISIBLE_BARS, WarmupPattern,
-    advance_beat_position, advance_song_beat_position, beats_per_cycle, close_menu_if_pointer_left,
-    draw_practice_target_notes, draw_target_notes, echo_countdown_value, echo_sequence_phase,
-    format_track_time, graph_high_note_choices, graph_low_note_choices, measure_phase,
-    midi_to_note, move_loop_handle, pitch, pitch_color, pitch_metrics, practice_phase,
-    root_note_choices, set_theme, should_show_scrub_preview, theme_is_dark, zoom_label,
+    AudioLoadStatus, BAR_BEATS, BASE_GRAPH_VIEW_SPAN, CENTS_TOLERANCE, COPYRIGHT, EchoPhase,
+    LOOP_HANDLE_HIT_RADIUS, LoopHandle, PitchHelperApp, ReferenceKind, Scale, ThemeChoice,
+    VISIBLE_BARS, WarmupPattern, advance_beat_position, advance_song_beat_position,
+    beats_per_cycle, close_menu_if_pointer_left, draw_practice_target_notes, draw_target_notes,
+    echo_countdown_value, echo_sequence_phase, format_track_time, graph_high_note_choices,
+    graph_low_note_choices, measure_phase, midi_to_note, move_loop_handle, pitch, pitch_color,
+    pitch_metrics, practice_phase, root_note_choices, set_theme, should_show_scrub_preview,
+    theme_is_dark, zoom_label,
 };
 use std::time::{Duration, Instant};
 
@@ -75,7 +76,11 @@ impl PitchHelperApp {
                     .show_value(false),
             )
             .on_hover_text(
-                "0.5x shows the full selected note range. 1x is the default view; higher values zoom in.",
+                format!(
+                    "Zoom is independent of LOW/HIGH. 0.5x shows up to {:.0} semitones; 1x shows {:.0}. The selected bounds can restrict the view.",
+                    BASE_GRAPH_VIEW_SPAN,
+                    BASE_GRAPH_VIEW_SPAN / 2.0
+                ),
             );
             ui.label(zoom_label(self.zoom_scale));
 
@@ -248,7 +253,6 @@ impl PitchHelperApp {
         });
         if refresh_inputs {
             self.refresh_input_devices();
-            self.last_device_refresh = Instant::now();
         }
     }
 
@@ -1290,10 +1294,7 @@ impl PitchHelperApp {
                         .strong()
                         .color(Color32::from_rgb(125, 145, 161)),
                 );
-                let metrics = pitch_metrics(
-                    &self.recent_pitch.iter().copied().collect::<Vec<_>>(),
-                    Instant::now(),
-                );
+                let metrics = pitch_metrics(&self.recent_pitch, Instant::now());
                 let label = match metrics {
                     Some(metrics) => match metrics.vibrato_hz {
                         Some(rate) if (3.0..=9.0).contains(&rate) => {
@@ -1514,25 +1515,27 @@ impl PitchHelperApp {
             );
         }
 
-        let points: Vec<_> = self
-            .history
-            .iter()
-            .filter_map(|(phase, midi)| {
-                if !(low_midi..=high_midi).contains(midi) {
-                    return None;
-                }
-                Some(egui::pos2(
-                    plot.left() + phase * plot.width(),
-                    plot.bottom() - (midi - low_midi) / (high_midi - low_midi) * plot.height(),
-                ))
-            })
-            .collect();
-        for pair in points.windows(2) {
-            let average_midi = (pair[0].y + pair[1].y) * 0.5;
-            let midi_at_y =
-                high_midi - (average_midi - plot.top()) / plot.height() * (high_midi - low_midi);
-            let cents = (midi_at_y - midi_at_y.round()) * 100.0;
-            painter.line_segment([pair[0], pair[1]], Stroke::new(2.4_f32, pitch_color(cents)));
+        let mut previous_point: Option<egui::Pos2> = None;
+        for (phase, midi) in &self.history {
+            if !(low_midi..=high_midi).contains(midi) {
+                previous_point = None;
+                continue;
+            }
+            let point = egui::pos2(
+                plot.left() + phase * plot.width(),
+                plot.bottom() - (midi - low_midi) / (high_midi - low_midi) * plot.height(),
+            );
+            if let Some(previous_point) = previous_point {
+                let average_y = (previous_point.y + point.y) * 0.5;
+                let midi_at_y =
+                    high_midi - (average_y - plot.top()) / plot.height() * (high_midi - low_midi);
+                let cents = (midi_at_y - midi_at_y.round()) * 100.0;
+                painter.line_segment(
+                    [previous_point, point],
+                    Stroke::new(2.4_f32, pitch_color(cents)),
+                );
+            }
+            previous_point = Some(point);
         }
 
         let now = Instant::now();
@@ -1654,10 +1657,7 @@ impl eframe::App for PitchHelperApp {
             self.last_cycle = cycle;
         }
         self.measure_phase = measure_phase(self.beat_position);
-        if self.last_device_refresh.elapsed() >= Duration::from_secs(2) {
-            self.refresh_input_devices();
-            self.last_device_refresh = now;
-        }
+        self.update_input_devices(now);
         self.update_audio();
         self.update_practice(now);
         self.update_graph_view();

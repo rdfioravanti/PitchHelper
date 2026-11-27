@@ -23,6 +23,7 @@ const VISIBLE_BARS: f32 = 4.0;
 const CENTS_TOLERANCE: f32 = 15.0;
 const LOOP_HANDLE_HIT_RADIUS: f32 = 12.0;
 const ECHO_COUNTDOWN_SECONDS: u64 = 3;
+const BASE_GRAPH_VIEW_SPAN: f32 = 72.0;
 const DEFAULT_RANGE_SENSITIVITY: f32 = 35.0;
 const RANGE_TRACKING_MIN_RMS: f32 = 0.002;
 const RANGE_TRACKING_MAX_RMS: f32 = 0.04;
@@ -115,6 +116,7 @@ enum ThemeChoice {
 struct PitchHelperApp {
     microphone: Microphone,
     input_devices: Vec<InputDevice>,
+    device_refresh: Option<Receiver<Result<Vec<InputDevice>, String>>>,
     selected_input: usize,
     metronome: Metronome,
     tone_player: TonePlayer,
@@ -180,10 +182,7 @@ impl PitchHelperApp {
         let theme = ThemeChoice::System;
         let applied_dark = theme_is_dark(theme);
         set_theme(&cc.egui_ctx, applied_dark);
-        let (input_devices, mut initial_error) = match Microphone::available_devices() {
-            Ok(devices) => (devices, None),
-            Err(error) => (Vec::new(), Some(error)),
-        };
+        let mut initial_error = None;
         let range_tracker = match RangeTracker::load() {
             Ok(tracker) => tracker,
             Err(error) => {
@@ -194,14 +193,11 @@ impl PitchHelperApp {
                 RangeTracker::default()
             }
         };
-        let selected_input = input_devices
-            .iter()
-            .position(|device| device.is_default)
-            .unwrap_or(0);
-        Self {
+        let mut app = Self {
             microphone: Microphone::new(),
-            input_devices,
-            selected_input,
+            input_devices: Vec::new(),
+            device_refresh: None,
+            selected_input: 0,
             metronome: Metronome::new(100.0, 0.35),
             tone_player: TonePlayer::new(),
             metronome_enabled: false,
@@ -259,7 +255,9 @@ impl PitchHelperApp {
             error: initial_error,
             about_open: false,
             clear_range_confirmation: false,
-        }
+        };
+        app.refresh_input_devices();
+        app
     }
 
     fn update_audio(&mut self) {
@@ -321,8 +319,7 @@ impl PitchHelperApp {
         }) {
             self.recent_pitch.pop_front();
         }
-        if let Some(metrics) =
-            pitch_metrics(&self.recent_pitch.iter().copied().collect::<Vec<_>>(), now)
+        if let Some(metrics) = pitch_metrics(&self.recent_pitch, now)
             && range_sample_is_eligible(analysis.rms, metrics.sample_span, self.range_sensitivity)
             && self.range_tracker.record(reading.midi, metrics.steady)
         {
@@ -694,51 +691,92 @@ impl PitchHelperApp {
     }
 
     fn refresh_input_devices(&mut self) {
+        if self.device_refresh.is_some() {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        match thread::Builder::new()
+            .name("pitchhelper-device-refresh".to_owned())
+            .spawn(move || {
+                let result = Microphone::available_devices();
+                let _ = sender.send(result);
+            }) {
+            Ok(_) => {
+                self.device_refresh = Some(receiver);
+                self.last_device_refresh = Instant::now();
+            }
+            Err(error) => {
+                self.last_device_refresh = Instant::now();
+                self.error = Some(format!("Could not refresh microphone devices: {error}"));
+            }
+        }
+    }
+
+    fn update_input_devices(&mut self, now: Instant) {
+        if let Some(receiver) = self.device_refresh.as_ref() {
+            match receiver.try_recv() {
+                Ok(Ok(devices)) => {
+                    self.device_refresh = None;
+                    self.last_device_refresh = now;
+                    self.apply_input_devices(devices);
+                }
+                Ok(Err(message)) => {
+                    self.device_refresh = None;
+                    self.last_device_refresh = now;
+                    self.error = Some(message);
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.device_refresh = None;
+                    self.last_device_refresh = now;
+                    self.error = Some("Microphone device refresh stopped unexpectedly.".to_owned());
+                }
+            }
+        }
+        if self.device_refresh.is_none()
+            && now.duration_since(self.last_device_refresh) >= Duration::from_secs(2)
+        {
+            self.refresh_input_devices();
+        }
+    }
+
+    fn apply_input_devices(&mut self, devices: Vec<InputDevice>) {
         let selected_device = self
             .input_devices
             .get(self.selected_input)
             .map(|device| (self.selected_input, device.name.clone(), device.is_default));
-        match Microphone::available_devices() {
-            Ok(devices) => {
-                let selected_is_present = selected_device
-                    .as_ref()
-                    .map(|(_, name, _)| devices.iter().any(|device| device.name == *name))
-                    .unwrap_or(false);
-                self.selected_input = selected_device
-                    .as_ref()
-                    .and_then(|(old_index, name, is_default)| {
-                        if devices
-                            .get(*old_index)
-                            .map(|device| device.name == *name)
-                            .unwrap_or(false)
-                        {
-                            return Some(*old_index);
-                        }
-                        devices
-                            .iter()
-                            .position(|device| {
-                                device.name == *name && device.is_default == *is_default
-                            })
-                            .or_else(|| devices.iter().position(|device| device.name == *name))
-                    })
-                    .or_else(|| devices.iter().position(|device| device.is_default))
-                    .unwrap_or(0);
-                self.input_devices = devices;
-                if (self.microphone.is_running() || self.microphone.is_starting())
-                    && !selected_is_present
+        let selected_is_present = selected_device
+            .as_ref()
+            .map(|(_, name, _)| devices.iter().any(|device| device.name == *name))
+            .unwrap_or(false);
+        self.selected_input = selected_device
+            .as_ref()
+            .and_then(|(old_index, name, is_default)| {
+                if devices
+                    .get(*old_index)
+                    .map(|device| device.name == *name)
+                    .unwrap_or(false)
                 {
-                    self.microphone.stop();
-                    self.reading = None;
-                    self.recent_pitch.clear();
-                    self.input_level_rms = 0.0;
-                    self.input_peak = 0.0;
-                    self.error = Some(
-                        "The selected microphone was disconnected. Select an input and start listening again."
-                            .to_owned(),
-                    );
+                    return Some(*old_index);
                 }
-            }
-            Err(message) => self.error = Some(message),
+                devices
+                    .iter()
+                    .position(|device| device.name == *name && device.is_default == *is_default)
+                    .or_else(|| devices.iter().position(|device| device.name == *name))
+            })
+            .or_else(|| devices.iter().position(|device| device.is_default))
+            .unwrap_or(0);
+        self.input_devices = devices;
+        if (self.microphone.is_running() || self.microphone.is_starting()) && !selected_is_present {
+            self.microphone.stop();
+            self.reading = None;
+            self.recent_pitch.clear();
+            self.input_level_rms = 0.0;
+            self.input_peak = 0.0;
+            self.error = Some(
+                "The selected microphone was disconnected. Select an input and start listening again."
+                    .to_owned(),
+            );
         }
     }
 
@@ -1063,9 +1101,9 @@ fn should_show_scrub_preview(cursor_x: f32, start_x: f32, end_x: f32) -> bool {
 }
 
 fn graph_range_for_zoom(min_note: f32, max_note: f32, zoom_scale: f32) -> (f32, f32) {
-    let zoom_scale = zoom_scale.clamp(0.5, 2.0) * 2.0;
+    let zoom_scale = zoom_scale.clamp(0.5, 2.0);
     let center = (min_note + max_note) * 0.5;
-    let span = (max_note - min_note) / zoom_scale;
+    let span = (BASE_GRAPH_VIEW_SPAN / (zoom_scale * 2.0)).min((max_note - min_note).max(0.0));
     (center - span * 0.5, center + span * 0.5)
 }
 
@@ -1146,10 +1184,13 @@ mod tests {
     }
 
     #[test]
-    fn default_zoom_is_one_and_half_zoom_shows_the_full_selected_range() {
+    fn zoom_scale_is_independent_of_bounds_when_the_selected_range_is_wide_enough() {
         assert_eq!(graph_range_for_zoom(24.0, 96.0, 0.5), (24.0, 96.0));
         assert_eq!(graph_range_for_zoom(24.0, 96.0, 1.0), (42.0, 78.0));
         assert_eq!(graph_range_for_zoom(24.0, 96.0, 2.0), (51.0, 69.0));
+        assert_eq!(graph_range_for_zoom(36.0, 96.0, 1.0), (48.0, 84.0));
+        assert_eq!(graph_range_for_zoom(12.0, 120.0, 0.5), (30.0, 102.0));
+        assert_eq!(graph_range_for_zoom(24.0, 60.0, 1.0), (24.0, 60.0));
         assert_eq!(zoom_label(1.0), "1x");
     }
 
