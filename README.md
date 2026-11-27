@@ -213,7 +213,7 @@ history if you want to discard earlier false detections.
 
 ### Settings & appearance
 
-The appearance follows the operating-system theme by default. Choose **Settings →
+The appearance follows the operating system theme by default. Choose **Settings →
 Appearance → System, Light, or Dark** to select a mode.
 **Settings → Range Sensitivity** opens a slider submenu for the range noise gate;
 higher values accept quieter signals. **Settings → Highlight Opacity** opens a
